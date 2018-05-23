@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"os/signal"
 
 	"github.com/spf13/viper"
 
@@ -134,28 +136,24 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 		return false
 	}
 
+	// Bail out if not nominal order
+	mn := binance.GetSymbol(buy.Symbol).Filters.MinimumNotional.MinNotional
+
+	if bv.LessThan(mn) || sv.LessThan(mn) {
+		log.WithFields(log.Fields{
+			"buy":  buy,
+			"sell": sell,
+			"mn":   mn,
+		}).Info("Skipping sub-notional order")
+		return false
+	}
+
 	return true
 }
 
 func newSpreadPlayerProcessor(symbol binance.Symbol) coinfactory.SymbolStreamProcessor {
 	proc := SpreadPlayerProcessor{symbol: symbol}
 	return &proc
-}
-
-func getExchangeList() {
-	// Get exchange info from the API
-	info := binance.GetExchangeInfo()
-
-	// Extract the symbols from the list for printing
-	log.Info("Total Exchanges: ", len(info.Symbols))
-	log.Info("Symbols: ", binance.GetSymbols())
-}
-
-func main() {
-	cf = coinfactory.NewCoinFactory(newSpreadPlayerProcessor)
-
-	getExchangeList()
-	cf.Start()
 }
 
 func setDefaultConfigValues() {
@@ -343,4 +341,18 @@ func normalizeQuantity(qty decimal.Decimal, symbol binance.Symbol) decimal.Decim
 	ss, _ := symbol.Filters.LotSize.StepSize.Float64()
 	places := int32(math.Log10(ss)) * -1
 	return qty.Round(places)
+}
+
+func main() {
+	cf = coinfactory.NewCoinFactory(newSpreadPlayerProcessor)
+	cf.Start()
+
+	// Intercept the interrupt signal and pass it along
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	select {
+	case <-interrupt:
+		cf.Stop()
+	}
 }
