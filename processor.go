@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/spf13/viper"
 
@@ -14,14 +15,9 @@ import (
 )
 
 type SpreadPlayerProcessor struct {
-	symbol          binance.Symbol
-	orderInProgress bool
-	orderPair       OrderPair
-}
-
-type OrderPair struct {
-	buyOrder  *coinfactory.Order
-	sellOrder *coinfactory.Order
+	symbol             binance.Symbol
+	openOrders         []*coinfactory.Order
+	janitorQuitChannel chan bool
 }
 
 var (
@@ -31,49 +27,78 @@ var (
 
 func (p *SpreadPlayerProcessor) ProcessData(data binance.SymbolTickerData) {
 
-	if !p.orderInProgress && isViable(data) {
+	if len(p.openOrders) == 0 && isViable(data) {
 
 		go p.placeQuoteBasedOrders(data)
 		go p.placeAssetBasedOrders(data)
-		p.orderInProgress = true
 	}
 }
 
-func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerData) (OrderPair, error) {
+func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
+	timer := time.NewTicker(15 * time.Second)
+
+	// Intercept the interrupt signal and pass it along
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	go func() {
+		select {
+		case <-timer.C:
+			for i, o := range p.openOrders {
+				switch o.GetStatus().Status {
+				// Skip this cases
+				case "NEW":
+				case "PARTIALLY_FILLED":
+				case "PENDING_CANCEL":
+				// Delete the rest
+				default:
+					p.openOrders = append(p.openOrders[:i], p.openOrders[i+1:]...)
+				}
+			}
+		case <-interrupt:
+			p.janitorQuitChannel <- true
+		case <-p.janitorQuitChannel:
+			return
+		}
+	}()
+}
+
+func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerData) {
 	buy, sell := p.buildQuoteBasedBuyOrderRequests(data)
 
 	if ok := validateOrderPair(buy, sell); !ok {
-		return OrderPair{}, nil
+		return
 	}
 
-	executeTestOrders(buy, sell)
-	return OrderPair{}, nil
+	// executeTestOrders(buy, sell)
 
-	// buyOrder, sellOrder, err := executeOrders(buy, sell)
-	// if err != nil {
-	// 	// Nothing to do
-	// 	return OrderPair{}, nil
-	// }
+	buyOrder, sellOrder, err := executeOrders(buy, sell)
+	if err != nil {
+		// Nothing to do
+		return
+	}
 
-	// return OrderPair{buyOrder, sellOrder}, nil
+	p.openOrders = append(p.openOrders, buyOrder)
+	p.openOrders = append(p.openOrders, sellOrder)
 }
 
-func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerData) (OrderPair, error) {
+func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerData) {
 	buy, sell := p.buildAssetBasedBuyOrderRequests(data)
 
 	if ok := validateOrderPair(buy, sell); !ok {
-		return OrderPair{}, nil
+		return
 	}
 
-	executeTestOrders(buy, sell)
-	return OrderPair{}, nil
-	// buyOrder, sellOrder, err := executeOrders(buy, sell)
-	// if err != nil {
-	// 	// Nothing to do
-	// 	return OrderPair{}, nil
-	// }
+	// executeTestOrders(buy, sell)
 
-	// return OrderPair{buyOrder, sellOrder}, nil
+	buyOrder, sellOrder, err := executeOrders(buy, sell)
+	if err != nil {
+		// Nothing to do
+		return
+	}
+
+	p.openOrders = append(p.openOrders, buyOrder)
+	p.openOrders = append(p.openOrders, sellOrder)
 }
 
 func executeOrders(buy coinfactory.OrderRequest, sell coinfactory.OrderRequest) (*coinfactory.Order, *coinfactory.Order, error) {
@@ -186,12 +211,11 @@ func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.Sym
 	spread := getSpread(data)
 	bufferPercent := decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.bufferpercent"))
 	txQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
-	targetSpread := spread.Sub(tradeFee).Mul(bufferPercent).Add(tradeFee).Mul(data.BidPrice)
-	txMargin := spread.Sub(targetSpread).Div(decimal.NewFromFloat(2))
+	targetSpread := spread.Sub(tradeFee).Mul(bufferPercent).Add(tradeFee)
+	txMargin := spread.Sub(targetSpread).Mul(data.BidPrice).Div(decimal.NewFromFloat(2))
 	buyAt := data.BidPrice.Add(txMargin)
 	sellAt := data.AskPrice.Sub(txMargin)
 	potentialReturn := sellAt.Sub(buyAt).Mul(txQty)
-	returnInQuote := potentialReturn.Mul(data.AskPrice)
 
 	log.WithFields(log.Fields{
 		"B":  data.BidPrice.Round(8).StringFixed(6),
@@ -199,16 +223,15 @@ func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.Sym
 		"A%": askPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
 		"B%": bidPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
 		"R":  potentialReturn.Round(8).StringFixed(6),
-		"r":  returnInQuote.Round(8).StringFixed(6),
 		"Q":  txQty.Round(8).StringFixed(6),
 		"B@": buyAt.Round(8).StringFixed(6),
 		"S@": sellAt.Round(8).StringFixed(6),
-	}).Info("Ticker for ", symbol.BaseAsset)
+	}).Info("Asset based ticker for ", symbol.BaseAsset)
 
 	buyQty := txQty
 	sellQty := txQty
-	buyPrice := normalizePrice(decimal.NewFromFloat(1).Div(sellAt), p.symbol)
-	sellPrice := normalizePrice(decimal.NewFromFloat(1).Div(buyAt), p.symbol)
+	buyPrice := normalizePrice(buyAt, p.symbol)
+	sellPrice := normalizePrice(sellAt, p.symbol)
 
 	// Check balances and adjust quantity if necessary
 	sym := binance.GetSymbol(symbol.Symbol)
@@ -259,14 +282,14 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 	bidPercent := data.AskPrice.Sub(data.BidPrice).Div(data.BidPrice)
 	quoteBid := decimal.NewFromFloat(1).Div(data.AskPrice)
 	quoteAsk := decimal.NewFromFloat(1).Div(data.BidPrice)
-	quoteSpread := quoteAsk.Sub(quoteBid)
+	quoteSpread := quoteAsk.Sub(quoteBid).Div(quoteBid)
 	bufferPercent := decimal.NewFromFloat((viper.GetFloat64("spreadprocessor.bufferpercent")))
 	txQty := data.QuoteVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
-	targetSpread := getSpread(data).Sub(tradeFee).Mul(bufferPercent).Add(tradeFee).Mul(quoteBid)
-	txMargin := quoteSpread.Sub(targetSpread).Div(decimal.NewFromFloat(2))
-	buyAt := quoteBid.Add(txMargin)
-	sellAt := quoteAsk.Sub(txMargin)
-	potentialReturn := sellAt.Sub(buyAt).Mul(txQty)
+	targetSpread := getSpread(data).Sub(tradeFee).Mul(bufferPercent).Add(tradeFee)
+	txMargin := quoteSpread.Sub(targetSpread).Mul(quoteBid).Div(decimal.NewFromFloat(2))
+	sellAt := quoteBid.Add(txMargin)
+	buyAt := quoteAsk.Sub(txMargin)
+	potentialReturn := buyAt.Sub(sellAt).Mul(txQty)
 	returnInQuote := potentialReturn.Mul(data.AskPrice)
 
 	log.WithFields(log.Fields{
@@ -279,12 +302,14 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 		"Q":  txQty.Round(8).StringFixed(6),
 		"B@": buyAt.Round(8).StringFixed(6),
 		"S@": sellAt.Round(8).StringFixed(6),
-	}).Info("Ticker for ", symbol.QuoteAsset)
+	}).Info("Quote based ticker for ", symbol.QuoteAsset)
 
 	buyQty := txQty.Mul(buyAt)
 	sellQty := txQty.Mul(sellAt)
-	buyPrice := normalizePrice(decimal.NewFromFloat(1).Div(sellAt), p.symbol)
-	sellPrice := normalizePrice(decimal.NewFromFloat(1).Div(buyAt), p.symbol)
+	buyPrice := decimal.NewFromFloat(1).Div(sellAt)
+	sellPrice := decimal.NewFromFloat(1).Div(buyAt)
+	buyPrice = normalizePrice(buyPrice, p.symbol)
+	sellPrice = normalizePrice(sellPrice, p.symbol)
 
 	// Check balances and adjust quantity if necessary
 	sym := binance.GetSymbol(symbol.Symbol)
@@ -354,5 +379,6 @@ func main() {
 	select {
 	case <-interrupt:
 		cf.Stop()
+
 	}
 }
