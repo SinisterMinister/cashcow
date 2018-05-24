@@ -306,8 +306,8 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 
 	buyQty := txQty.Mul(buyAt)
 	sellQty := txQty.Mul(sellAt)
-	buyPrice := decimal.NewFromFloat(1).Div(sellAt)
-	sellPrice := decimal.NewFromFloat(1).Div(buyAt)
+	sellPrice := decimal.NewFromFloat(1).Div(sellAt)
+	buyPrice := decimal.NewFromFloat(1).Div(buyAt)
 	buyPrice = normalizePrice(buyPrice, p.symbol)
 	sellPrice = normalizePrice(sellPrice, p.symbol)
 
