@@ -43,23 +43,25 @@ func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
 	signal.Notify(interrupt, os.Interrupt)
 
 	go func() {
-		select {
-		case <-timer.C:
-			for i, o := range p.openOrders {
-				switch o.GetStatus().Status {
-				// Skip this cases
-				case "NEW":
-				case "PARTIALLY_FILLED":
-				case "PENDING_CANCEL":
-				// Delete the rest
-				default:
-					p.openOrders = append(p.openOrders[:i], p.openOrders[i+1:]...)
+		for {
+			select {
+			case <-timer.C:
+				for i, o := range p.openOrders {
+					switch o.GetStatus().Status {
+					// Skip this cases
+					case "NEW":
+					case "PARTIALLY_FILLED":
+					case "PENDING_CANCEL":
+					// Delete the rest
+					default:
+						p.openOrders = append(p.openOrders[:i], p.openOrders[i+1:]...)
+					}
 				}
+			case <-interrupt:
+				p.janitorQuitChannel <- true
+			case <-p.janitorQuitChannel:
+				return
 			}
-		case <-interrupt:
-			p.janitorQuitChannel <- true
-		case <-p.janitorQuitChannel:
-			return
 		}
 	}()
 }
