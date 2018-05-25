@@ -9,6 +9,7 @@ import (
 )
 
 func main() {
+	setDefaultConfigValues()
 	cf = coinfactory.NewCoinFactory(newSpreadPlayerProcessor)
 	cf.Start()
 
@@ -23,6 +24,8 @@ func main() {
 }
 
 func setDefaultConfigValues() {
-	viper.SetDefault("spreadprocessor.bufferpercent", .50)
+	viper.SetDefault("spreadprocessor.bufferPercent", .50)
 	viper.SetDefault("spreadprocessor.fallbackQuantityBalancePercent", .45)
+	viper.SetDefault("spreadprocessor.markOrderAsStaleAfter", "5m")
+	viper.SetDefault("spreadprocessor.cancelOrderAfter", "20m")
 }

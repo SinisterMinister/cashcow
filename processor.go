@@ -1,10 +1,7 @@
 package main
 
 import (
-	"os"
-	"os/signal"
 	"sync"
-	"time"
 
 	"github.com/spf13/viper"
 
@@ -17,6 +14,7 @@ import (
 type SpreadPlayerProcessor struct {
 	symbol             binance.Symbol
 	openOrders         []*coinfactory.Order
+	staleOrders        []*coinfactory.Order
 	janitorQuitChannel chan bool
 	openOrdersMux      *sync.Mutex
 }
@@ -36,36 +34,8 @@ func (p *SpreadPlayerProcessor) ProcessData(data binance.SymbolTickerData) {
 }
 
 func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
-	timer := time.NewTicker(15 * time.Second)
-
-	// Intercept the interrupt signal and pass it along
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-
-	go func() {
-		for {
-			select {
-			case <-timer.C:
-				p.openOrdersMux.Lock()
-				for i, o := range p.openOrders {
-					switch o.GetStatus().Status {
-					// Skip this cases
-					case "NEW":
-					case "PARTIALLY_FILLED":
-					case "PENDING_CANCEL":
-					// Delete the rest
-					default:
-						p.openOrders = append(p.openOrders[:i], p.openOrders[i+1:]...)
-					}
-					p.openOrdersMux.Unlock()
-				}
-			case <-interrupt:
-				p.janitorQuitChannel <- true
-			case <-p.janitorQuitChannel:
-				return
-			}
-		}
-	}()
+	log.Info("Starting order janitor")
+	go startJanitor(p)
 }
 
 func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerData) {
@@ -115,7 +85,7 @@ func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.Sym
 	askPercent := data.AskPrice.Sub(data.BidPrice).Div(data.AskPrice)
 	bidPercent := data.AskPrice.Sub(data.BidPrice).Div(data.BidPrice)
 	spread := getSpread(data)
-	bufferPercent := decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.bufferpercent"))
+	bufferPercent := decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.bufferPercent"))
 	txQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
 	targetSpread := spread.Sub(tradeFee.Mul(decimal.NewFromFloat(2))).Mul(bufferPercent).Add(tradeFee.Mul(decimal.NewFromFloat(2)))
 	txMargin := spread.Sub(targetSpread).Mul(data.BidPrice).Div(decimal.NewFromFloat(2))
@@ -189,7 +159,7 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 	quoteBid := decimal.NewFromFloat(1).Div(data.AskPrice)
 	quoteAsk := decimal.NewFromFloat(1).Div(data.BidPrice)
 	quoteSpread := quoteAsk.Sub(quoteBid).Div(quoteBid)
-	bufferPercent := decimal.NewFromFloat((viper.GetFloat64("spreadprocessor.bufferpercent")))
+	bufferPercent := decimal.NewFromFloat((viper.GetFloat64("spreadprocessor.bufferPercent")))
 	txQty := data.QuoteVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
 	targetSpread := getSpread(data).Sub(tradeFee.Mul(decimal.NewFromFloat(2))).Mul(bufferPercent).Add(tradeFee.Mul(decimal.NewFromFloat(2)))
 	txMargin := quoteSpread.Sub(targetSpread).Mul(quoteBid).Div(decimal.NewFromFloat(2))

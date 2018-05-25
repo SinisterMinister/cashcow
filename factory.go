@@ -11,8 +11,11 @@ func newSpreadPlayerProcessor(symbol binance.Symbol) coinfactory.SymbolStreamPro
 	proc := SpreadPlayerProcessor{
 		symbol:             symbol,
 		openOrders:         []*coinfactory.Order{},
+		staleOrders:        []*coinfactory.Order{},
 		janitorQuitChannel: make(chan bool),
 		openOrdersMux:      &sync.Mutex{},
 	}
+
+	proc.startOpenOrderJanitor()
 	return &proc
 }
