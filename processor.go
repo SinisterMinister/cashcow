@@ -46,6 +46,7 @@ func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
 		for {
 			select {
 			case <-timer.C:
+				p.openOrdersMux.Lock()
 				for i, o := range p.openOrders {
 					switch o.GetStatus().Status {
 					// Skip this cases
@@ -56,6 +57,7 @@ func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
 					default:
 						p.openOrders = append(p.openOrders[:i], p.openOrders[i+1:]...)
 					}
+					p.openOrdersMux.Unlock()
 				}
 			case <-interrupt:
 				p.janitorQuitChannel <- true
@@ -81,8 +83,10 @@ func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerD
 		return
 	}
 
+	p.openOrdersMux.Lock()
 	p.openOrders = append(p.openOrders, buyOrder)
 	p.openOrders = append(p.openOrders, sellOrder)
+	p.openOrdersMux.Unlock()
 }
 
 func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerData) {
@@ -100,8 +104,10 @@ func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerD
 		return
 	}
 
+	p.openOrdersMux.Lock()
 	p.openOrders = append(p.openOrders, buyOrder)
 	p.openOrders = append(p.openOrders, sellOrder)
+	p.openOrdersMux.Unlock()
 }
 
 func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.SymbolTickerData) (coinfactory.OrderRequest, coinfactory.OrderRequest) {

@@ -19,11 +19,10 @@ func main() {
 	select {
 	case <-interrupt:
 		cf.Stop()
-
 	}
 }
 
 func setDefaultConfigValues() {
 	viper.SetDefault("spreadprocessor.bufferpercent", .50)
-	viper.SetDefault("spreadprocessor.fallbackQuantityBalancePercent", .9)
+	viper.SetDefault("spreadprocessor.fallbackQuantityBalancePercent", .45)
 }
