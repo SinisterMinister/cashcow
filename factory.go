@@ -4,10 +4,9 @@ import (
 	"sync"
 
 	"github.com/sinisterminister/coinfactory"
-	"github.com/sinisterminister/coinfactory/pkg/binance"
 )
 
-func newSpreadPlayerProcessor(symbol binance.Symbol) coinfactory.SymbolStreamProcessor {
+func newSpreadPlayerProcessor(symbol *coinfactory.Symbol) coinfactory.SymbolStreamProcessor {
 	proc := SpreadPlayerProcessor{
 		symbol:             symbol,
 		openOrders:         []*coinfactory.Order{},

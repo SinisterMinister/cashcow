@@ -9,14 +9,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func normalizePrice(price decimal.Decimal, symbol binance.Symbol) decimal.Decimal {
+func normalizePrice(price decimal.Decimal, symbol *coinfactory.Symbol) decimal.Decimal {
 	// Get decimal places and round to that precision
 	ts, _ := symbol.Filters.Price.TickSize.Float64()
 	places := int32(math.Log10(ts)) * -1
 	return price.Round(places)
 }
 
-func normalizeQuantity(qty decimal.Decimal, symbol binance.Symbol) decimal.Decimal {
+func normalizeQuantity(qty decimal.Decimal, symbol *coinfactory.Symbol) decimal.Decimal {
 	// Get decimal places and round to that precision
 	ss, _ := symbol.Filters.LotSize.StepSize.Float64()
 	places := int32(math.Log10(ss)) * -1
@@ -98,7 +98,7 @@ func executeOrders(buy coinfactory.OrderRequest, sell coinfactory.OrderRequest) 
 
 	sellOrder, err0 := cf.GetOrderManager().AttemptOrder(sell)
 	if err0 != nil {
-		log.WithError(err0).Error("Could not place order!")
+		log.WithError(err0).Error("Could not place order! Cancelling previous order")
 		// Cancel buy order
 		err1 := cf.GetOrderManager().CancelOrder(buyOrder)
 		if err1 != nil {

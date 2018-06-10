@@ -12,7 +12,7 @@ import (
 )
 
 type SpreadPlayerProcessor struct {
-	symbol             binance.Symbol
+	symbol             *coinfactory.Symbol
 	openOrders         []*coinfactory.Order
 	staleOrders        []*coinfactory.Order
 	janitorQuitChannel chan bool
@@ -27,9 +27,10 @@ var (
 func (p *SpreadPlayerProcessor) ProcessData(data binance.SymbolTickerData) {
 
 	if len(p.openOrders) == 0 && isViable(data) {
+		// go p.placeQuoteBasedOrders(data)
+		// go p.placeAssetBasedOrders(data)
 
-		go p.placeQuoteBasedOrders(data)
-		go p.placeAssetBasedOrders(data)
+		go p.placeCombinedOrder(data)
 	}
 }
 
@@ -40,6 +41,11 @@ func (p *SpreadPlayerProcessor) startOpenOrderJanitor() {
 
 func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerData) {
 	buy, sell := p.buildQuoteBasedBuyOrderRequests(data)
+
+	// Adjust the orders based on the trend, available funds, and order filters
+	p.adjustOrdersPriceBasedOnTrix(&buy, &sell)
+	p.adjustOrdersQuantityBasedOnAvailableFunds(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
 
 	if ok := validateOrderPair(buy, sell); !ok {
 		return
@@ -62,11 +68,14 @@ func (p *SpreadPlayerProcessor) placeQuoteBasedOrders(data binance.SymbolTickerD
 func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerData) {
 	buy, sell := p.buildAssetBasedBuyOrderRequests(data)
 
+	// Adjust the orders based on the trend, available funds, and order filters
+	p.adjustOrdersPriceBasedOnTrix(&buy, &sell)
+	p.adjustOrdersQuantityBasedOnAvailableFunds(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
+
 	if ok := validateOrderPair(buy, sell); !ok {
 		return
 	}
-
-	// executeTestOrders(buy, sell)
 
 	buyOrder, sellOrder, err := executeOrders(buy, sell)
 	if err != nil {
@@ -78,6 +87,103 @@ func (p *SpreadPlayerProcessor) placeAssetBasedOrders(data binance.SymbolTickerD
 	p.openOrders = append(p.openOrders, buyOrder)
 	p.openOrders = append(p.openOrders, sellOrder)
 	p.openOrdersMux.Unlock()
+}
+
+func (p *SpreadPlayerProcessor) placeCombinedOrder(data binance.SymbolTickerData) {
+	buy, sell := p.buildCombinedOrderRequests(data)
+
+	// Adjust the orders based on the trend, available funds, and order filters
+	p.adjustOrdersQuantityBasedOnAvailableFunds(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
+
+	if ok := validateOrderPair(buy, sell); !ok {
+		return
+	}
+
+	p.adjustOrdersPriceBasedOnTrix(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
+
+	if ok := validateOrderPair(buy, sell); !ok {
+		return
+	}
+
+	buyOrder, sellOrder, err := executeOrders(buy, sell)
+	if err != nil {
+		// Nothing to do
+		return
+	}
+
+	p.openOrdersMux.Lock()
+	p.openOrders = append(p.openOrders, buyOrder)
+	p.openOrders = append(p.openOrders, sellOrder)
+	p.openOrdersMux.Unlock()
+}
+
+func (p *SpreadPlayerProcessor) adjustOrdersPriceBasedOnTrix(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest) (err error) {
+	_, trixOsc, err := p.symbol.GetCurrentTrixIndicator("1m", 5)
+	if err != nil {
+		return err
+	}
+
+	// Adjust order based on oscillator for now
+	buyOrder.Price = buyOrder.Price.Add(buyOrder.Price.Mul(decimal.NewFromFloat(trixOsc)))
+	sellOrder.Price = sellOrder.Price.Add(sellOrder.Price.Mul(decimal.NewFromFloat(trixOsc)))
+
+	return err
+}
+
+func (p *SpreadPlayerProcessor) adjustOrdersQuantityBasedOnAvailableFunds(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest) {
+	// Check balances and adjust quantity if necessary
+	quoteBalance := cf.GetBalanceManager().GetAvailableBalance(p.symbol.QuoteAsset)
+	baseBalance := cf.GetBalanceManager().GetAvailableBalance(p.symbol.BaseAsset)
+
+	log.WithFields(log.Fields{
+		p.symbol.BaseAsset:  baseBalance,
+		p.symbol.QuoteAsset: quoteBalance,
+	}).Debug("Wallet balances")
+
+	if buyOrder.Quantity.Mul(buyOrder.Price).GreaterThan(quoteBalance) {
+		adjPercent := quoteBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(buyOrder.Price).Div(buyOrder.Quantity)
+		buyOrder.Quantity = buyOrder.Quantity.Mul(adjPercent)
+		sellOrder.Quantity = sellOrder.Quantity.Mul(adjPercent)
+	}
+
+	if sellOrder.Quantity.GreaterThan(baseBalance) {
+		adjPercent := baseBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(sellOrder.Quantity)
+		buyOrder.Quantity = buyOrder.Quantity.Mul(adjPercent)
+		sellOrder.Quantity = sellOrder.Quantity.Mul(adjPercent)
+	}
+}
+
+func (p *SpreadPlayerProcessor) normalizeOrders(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest) {
+	// Normalize the price
+	buyOrder.Price = normalizePrice(buyOrder.Price, p.symbol)
+	sellOrder.Price = normalizePrice(sellOrder.Price, p.symbol)
+
+	// Normalize quantities
+	buyOrder.Quantity = normalizeQuantity(buyOrder.Quantity, p.symbol)
+	sellOrder.Quantity = normalizeQuantity(sellOrder.Quantity, p.symbol)
+}
+
+func (p *SpreadPlayerProcessor) buildCombinedOrderRequests(data binance.SymbolTickerData) (buyOrder coinfactory.OrderRequest, sellOrder coinfactory.OrderRequest) {
+	// Get orders
+	assetBasedBuy, assetBasedSell := p.buildAssetBasedBuyOrderRequests(data)
+	quoteBasedBuy, quoteBasedSell := p.buildQuoteBasedBuyOrderRequests(data)
+
+	// Create combined orders
+	buyOrder = coinfactory.OrderRequest{}
+	buyOrder.Symbol = p.symbol.Symbol
+	buyOrder.Side = "BUY"
+	buyOrder.Quantity = assetBasedBuy.Quantity.Add(quoteBasedBuy.Quantity)
+	buyOrder.Price = assetBasedBuy.Price
+
+	sellOrder = coinfactory.OrderRequest{}
+	sellOrder.Symbol = p.symbol.Symbol
+	sellOrder.Side = "SELL"
+	sellOrder.Quantity = quoteBasedSell.Quantity.Add(assetBasedSell.Quantity)
+	sellOrder.Price = assetBasedSell.Price
+
+	return buyOrder, sellOrder
 }
 
 func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.SymbolTickerData) (coinfactory.OrderRequest, coinfactory.OrderRequest) {
@@ -108,32 +214,6 @@ func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.Sym
 	sellQty := txQty
 	buyPrice := normalizePrice(buyAt, p.symbol)
 	sellPrice := normalizePrice(sellAt, p.symbol)
-
-	// Check balances and adjust quantity if necessary
-	sym := binance.GetSymbol(symbol.Symbol)
-	quoteBalance := cf.GetBalanceManager().GetAvailableBalance(sym.QuoteAsset)
-	baseBalance := cf.GetBalanceManager().GetAvailableBalance(sym.BaseAsset)
-
-	log.WithFields(log.Fields{
-		sym.BaseAsset:  baseBalance,
-		sym.QuoteAsset: quoteBalance,
-	}).Debug("Wallet balances")
-
-	if buyQty.Mul(buyPrice).GreaterThan(quoteBalance) {
-		adjPercent := quoteBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(buyPrice).Div(buyQty)
-		buyQty = buyQty.Mul(adjPercent)
-		sellQty = sellQty.Mul(adjPercent)
-	}
-
-	if sellQty.GreaterThan(baseBalance) {
-		adjPercent := baseBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(sellQty)
-		buyQty = buyQty.Mul(adjPercent)
-		sellQty = sellQty.Mul(adjPercent)
-	}
-
-	// Normalize quantities
-	buyQty = normalizeQuantity(buyQty, p.symbol)
-	sellQty = normalizeQuantity(sellQty, p.symbol)
 
 	buyOrder := coinfactory.OrderRequest{
 		Symbol:   symbol.Symbol,
@@ -186,32 +266,6 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 	buyPrice := decimal.NewFromFloat(1).Div(buyAt)
 	buyPrice = normalizePrice(buyPrice, p.symbol)
 	sellPrice = normalizePrice(sellPrice, p.symbol)
-
-	// Check balances and adjust quantity if necessary
-	sym := binance.GetSymbol(symbol.Symbol)
-	quoteBalance := cf.GetBalanceManager().GetAvailableBalance(sym.QuoteAsset)
-	baseBalance := cf.GetBalanceManager().GetAvailableBalance(sym.BaseAsset)
-
-	log.WithFields(log.Fields{
-		sym.BaseAsset:  baseBalance,
-		sym.QuoteAsset: quoteBalance,
-	}).Debug("Wallet balances")
-
-	if buyQty.Mul(buyPrice).GreaterThan(quoteBalance) {
-		adjPercent := quoteBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(buyPrice).Div(buyQty)
-		buyQty = buyQty.Mul(adjPercent)
-		sellQty = sellQty.Mul(adjPercent)
-	}
-
-	if sellQty.GreaterThan(baseBalance) {
-		adjPercent := baseBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(sellQty)
-		buyQty = buyQty.Mul(adjPercent)
-		sellQty = sellQty.Mul(adjPercent)
-	}
-
-	// Normalize quantities
-	buyQty = normalizeQuantity(buyQty, p.symbol)
-	sellQty = normalizeQuantity(sellQty, p.symbol)
 
 	buyOrder := coinfactory.OrderRequest{
 		Symbol:   symbol.Symbol,
