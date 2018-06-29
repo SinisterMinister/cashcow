@@ -8,12 +8,15 @@ import (
 	"github.com/spf13/viper"
 )
 
-var SymbolService coinfactory.SymbolService
+var (
+	SymbolService coinfactory.SymbolService
+	cf            coinfactory.Coinfactory
+)
 
 func main() {
 	setDefaultConfigValues()
 	SymbolService = coinfactory.GetSymbolService()
-	cf = coinfactory.NewCoinFactory(newSpreadPlayerProcessor)
+	cf = coinfactory.NewCoinFactory(newFollowTheLeaderProcessor)
 	cf.Start()
 
 	// Intercept the interrupt signal and pass it along
@@ -31,4 +34,9 @@ func setDefaultConfigValues() {
 	viper.SetDefault("spreadprocessor.fallbackQuantityBalancePercent", .45)
 	viper.SetDefault("spreadprocessor.markOrderAsStaleAfter", "5m")
 	viper.SetDefault("spreadprocessor.cancelOrderAfter", "4h")
+
+	viper.SetDefault("followtheleaderprocessor.percentReturnTarget", .001)
+	viper.SetDefault("followtheleaderprocessor.fallbackQuantityBalancePercent", .20)
+	viper.SetDefault("followtheleaderprocessor.markOrderAsStaleAfter", "1m")
+	viper.SetDefault("followtheleaderprocessor.cancelOrderAfter", "4h")
 }

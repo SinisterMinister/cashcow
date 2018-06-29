@@ -7,6 +7,7 @@ import (
 	"github.com/sinisterminister/coinfactory"
 	"github.com/sinisterminister/coinfactory/pkg/binance"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 )
 
 func normalizePrice(price decimal.Decimal, symbol *coinfactory.Symbol) decimal.Decimal {
@@ -42,7 +43,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 		log.WithFields(log.Fields{
 			"buy":  buy,
 			"sell": sell,
-		}).Info("Skipping zero value order")
+		}).Warn("Skipping zero value order")
 		return false
 	}
 
@@ -57,7 +58,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 		log.WithFields(log.Fields{
 			"buy":  buy,
 			"sell": sell,
-		}).Info("Skipping negative return order")
+		}).Warn("Skipping negative return order")
 		return false
 	}
 
@@ -69,7 +70,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 			"buy":  buy,
 			"sell": sell,
 			"mn":   mn,
-		}).Info("Skipping sub-notional order")
+		}).Warn("Skipping sub-notional order")
 		return false
 	}
 
@@ -114,4 +115,37 @@ func executeOrders(buy coinfactory.OrderRequest, sell coinfactory.OrderRequest) 
 func logTicker(data binance.SymbolTickerData) {
 	// askPercent := data.AskPrice.Sub(data.BidPrice).Div(data.AskPrice)
 	// bidPercent := data.AskPrice.Sub(data.BidPrice).Div(data.BidPrice)
+}
+
+func adjustOrdersQuantityBasedOnAvailableFunds(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest, symbol *coinfactory.Symbol) {
+	// Check balances and adjust quantity if necessary
+	quoteBalance := cf.GetBalanceManager().GetAvailableBalance(symbol.QuoteAsset)
+	baseBalance := cf.GetBalanceManager().GetAvailableBalance(symbol.BaseAsset)
+
+	log.WithFields(log.Fields{
+		symbol.BaseAsset:  baseBalance,
+		symbol.QuoteAsset: quoteBalance,
+	}).Debug("Wallet balances")
+
+	if buyOrder.Quantity.Mul(buyOrder.Price).GreaterThan(quoteBalance) {
+		adjPercent := quoteBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(buyOrder.Price).Div(buyOrder.Quantity)
+		buyOrder.Quantity = buyOrder.Quantity.Mul(adjPercent)
+		sellOrder.Quantity = sellOrder.Quantity.Mul(adjPercent)
+	}
+
+	if sellOrder.Quantity.GreaterThan(baseBalance) {
+		adjPercent := baseBalance.Mul(decimal.NewFromFloat(viper.GetFloat64("spreadprocessor.fallbackQuantityBalancePercent"))).Div(sellOrder.Quantity)
+		buyOrder.Quantity = buyOrder.Quantity.Mul(adjPercent)
+		sellOrder.Quantity = sellOrder.Quantity.Mul(adjPercent)
+	}
+}
+
+func normalizeOrders(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest, symbol *coinfactory.Symbol) {
+	// Normalize the price
+	buyOrder.Price = normalizePrice(buyOrder.Price, symbol)
+	sellOrder.Price = normalizePrice(sellOrder.Price, symbol)
+
+	// Normalize quantities
+	buyOrder.Quantity = normalizeQuantity(buyOrder.Quantity, symbol)
+	sellOrder.Quantity = normalizeQuantity(sellOrder.Quantity, symbol)
 }

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"os/signal"
 	"sync"
+	"time"
 
 	"github.com/spf13/viper"
 
@@ -11,6 +15,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var tradeFee = decimal.NewFromFloat(0.001)
+
 type SpreadPlayerProcessor struct {
 	symbol             *coinfactory.Symbol
 	openOrders         []*coinfactory.Order
@@ -19,17 +25,8 @@ type SpreadPlayerProcessor struct {
 	openOrdersMux      *sync.Mutex
 }
 
-var (
-	tradeFee = decimal.NewFromFloat(0.001)
-	cf       coinfactory.Coinfactory
-)
-
 func (p *SpreadPlayerProcessor) ProcessData(data binance.SymbolTickerData) {
-
 	if len(p.openOrders) == 0 && isViable(data) {
-		// go p.placeQuoteBasedOrders(data)
-		// go p.placeAssetBasedOrders(data)
-
 		go p.placeCombinedOrder(data)
 	}
 }
@@ -119,15 +116,58 @@ func (p *SpreadPlayerProcessor) placeCombinedOrder(data binance.SymbolTickerData
 	p.openOrdersMux.Unlock()
 }
 
+func (p *SpreadPlayerProcessor) placeCombinedTestOrder(data binance.SymbolTickerData) {
+	buy, sell := p.buildCombinedOrderRequests(data)
+
+	// Adjust the orders based on the trend, available funds, and order filters
+	p.adjustOrdersQuantityBasedOnAvailableFunds(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
+
+	if ok := validateOrderPair(buy, sell); !ok {
+		return
+	}
+
+	p.adjustOrdersPriceBasedOnTrix(&buy, &sell)
+	p.normalizeOrders(&buy, &sell)
+
+	if ok := validateOrderPair(buy, sell); !ok {
+		return
+	}
+
+	executeTestOrders(buy, sell)
+}
+
 func (p *SpreadPlayerProcessor) adjustOrdersPriceBasedOnTrix(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest) (err error) {
-	_, trixOsc, err := p.symbol.GetCurrentTrixIndicator("1m", 5)
+	ma, trixOsc, err := p.symbol.GetCurrentTrixIndicator("1m", 5)
 	if err != nil {
 		return err
 	}
 
+	// We're checking to see if the oscillator and the percent change between the
+	// moving average and the current price are heading the same direction
+	maDec := decimal.NewFromFloat(ma)
+	oscDec := decimal.NewFromFloat(trixOsc)
+	testOsc := p.symbol.GetTicker().CurrentClosePrice.Sub(maDec).Div(maDec)
+
+	if !(testOsc.GreaterThanOrEqual(decimal.Zero) && oscDec.GreaterThanOrEqual(decimal.Zero)) && !(testOsc.LessThanOrEqual(decimal.Zero) && oscDec.LessThanOrEqual(decimal.Zero)) {
+		return errors.New("price too unstable")
+	}
+
 	// Adjust order based on oscillator for now
-	buyOrder.Price = buyOrder.Price.Add(buyOrder.Price.Mul(decimal.NewFromFloat(trixOsc)))
-	sellOrder.Price = sellOrder.Price.Add(sellOrder.Price.Mul(decimal.NewFromFloat(trixOsc)))
+	buyOrder.Price = buyOrder.Price.Add(buyOrder.Price.Mul(oscDec))
+	sellOrder.Price = sellOrder.Price.Add(sellOrder.Price.Mul(oscDec))
+
+	log.WithFields(log.Fields{
+		"symbol":       p.symbol.Symbol,
+		"ma":           maDec.StringFixed(8),
+		"oscillator":   oscDec.StringFixed(8),
+		"test":         testOsc.StringFixed(8),
+		"currentPrice": p.symbol.GetTicker().CurrentClosePrice.StringFixed(8),
+		"bid":          p.symbol.GetTicker().BidPrice.StringFixed(8),
+		"ask":          p.symbol.GetTicker().AskPrice.StringFixed(8),
+		"buyPrice":     buyOrder.Price.StringFixed(8),
+		"sellPrice":    sellOrder.Price.StringFixed(8),
+	}).Info("TRIX Indicator")
 
 	return err
 }
@@ -200,14 +240,14 @@ func (p *SpreadPlayerProcessor) buildAssetBasedBuyOrderRequests(data binance.Sym
 	potentialReturn := sellAt.Sub(buyAt).Mul(txQty)
 
 	log.WithFields(log.Fields{
-		"B":  data.BidPrice.Round(8).StringFixed(6),
-		"A":  data.AskPrice.Round(8).StringFixed(6),
-		"A%": askPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
-		"B%": bidPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
-		"R":  potentialReturn.Round(8).StringFixed(6),
-		"Q":  txQty.Round(8).StringFixed(6),
-		"B@": buyAt.Round(8).StringFixed(6),
-		"S@": sellAt.Round(8).StringFixed(6),
+		"B":  data.BidPrice.Round(8).StringFixed(8),
+		"A":  data.AskPrice.Round(8).StringFixed(8),
+		"A%": askPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(8),
+		"B%": bidPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(8),
+		"R":  potentialReturn.Round(8).StringFixed(8),
+		"Q":  txQty.Round(8).StringFixed(8),
+		"B@": buyAt.Round(8).StringFixed(8),
+		"S@": sellAt.Round(8).StringFixed(8),
 	}).Info("Asset based ticker for ", symbol.BaseAsset)
 
 	buyQty := txQty
@@ -249,15 +289,15 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 	returnInQuote := potentialReturn.Mul(data.AskPrice)
 
 	log.WithFields(log.Fields{
-		"B":  quoteBid.Round(8).StringFixed(6),
-		"A":  quoteAsk.Round(8).StringFixed(6),
-		"A%": askPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
-		"B%": bidPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(6),
-		"R":  potentialReturn.Round(8).StringFixed(6),
-		"r":  returnInQuote.Round(8).StringFixed(6),
-		"Q":  txQty.Round(8).StringFixed(6),
-		"B@": buyAt.Round(8).StringFixed(6),
-		"S@": sellAt.Round(8).StringFixed(6),
+		"B":  quoteBid.Round(8).StringFixed(8),
+		"A":  quoteAsk.Round(8).StringFixed(8),
+		"A%": askPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(8),
+		"B%": bidPercent.Mul(decimal.NewFromFloat(100)).Round(8).StringFixed(8),
+		"R":  potentialReturn.Round(8).StringFixed(8),
+		"r":  returnInQuote.Round(8).StringFixed(8),
+		"Q":  txQty.Round(8).StringFixed(8),
+		"B@": buyAt.Round(8).StringFixed(8),
+		"S@": sellAt.Round(8).StringFixed(8),
 	}).Info("Quote based ticker for ", symbol.QuoteAsset)
 
 	buyQty := txQty.Mul(buyAt)
@@ -282,4 +322,276 @@ func (p *SpreadPlayerProcessor) buildQuoteBasedBuyOrderRequests(data binance.Sym
 	}
 
 	return buyOrder, sellOrder
+}
+
+type FollowTheLeaderProcessor struct {
+	symbol             *coinfactory.Symbol
+	openOrders         []*coinfactory.Order
+	staleOrders        []*coinfactory.Order
+	janitorQuitChannel chan bool
+	openOrdersMux      *sync.RWMutex
+}
+
+func (processor *FollowTheLeaderProcessor) ProcessData(data binance.SymbolTickerData) {
+	// Check if ready for data
+	if !processor.isReady() {
+		// Not ready. Skip.
+		return
+	}
+
+	// Attempt the order
+	processor.attemptOrder(data)
+}
+
+func (processor *FollowTheLeaderProcessor) init() {
+	go processor.startJanitor()
+}
+
+func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTickerData) {
+	var buyRequest, sellRequest coinfactory.OrderRequest
+
+	// Get count of stale orders
+	processor.openOrdersMux.RLock()
+	numStaleOrders := len(processor.staleOrders)
+	processor.openOrdersMux.RUnlock()
+
+	// If stale orders exist, use them as the leader to follow, otherwise use trix
+	if numStaleOrders > 0 {
+		// Throttle based on stalled orders
+		if numStaleOrders < 3 {
+			log.Warn("throttling due to too many stale orders")
+			return
+		}
+		buyRequest, sellRequest = processor.buildLeaderBasedOrderRequests(data)
+	} else {
+		// Get TRIX based orders
+		var err error
+		buyRequest, sellRequest, err = processor.buildTrixBasedOrderRequests(data)
+		if err != nil {
+			log.WithError(err).Error("could not build trix based order requests")
+			return
+		}
+	}
+
+	// Adjust orders to not go over available balances
+	adjustOrdersQuantityBasedOnAvailableFunds(&buyRequest, &sellRequest, processor.symbol)
+
+	// Normalize orders
+	normalizeOrders(&buyRequest, &sellRequest, processor.symbol)
+
+	// Abort if order pair will fail or have a negative return
+	if ok := validateOrderPair(buyRequest, sellRequest); !ok {
+		return
+	}
+
+	buyOrder, sellOrder, err := executeOrders(buyRequest, sellRequest)
+	if err != nil {
+		// Nothing to do
+		return
+	}
+
+	processor.openOrdersMux.Lock()
+	processor.openOrders = append(processor.openOrders, buyOrder)
+	processor.openOrders = append(processor.openOrders, sellOrder)
+	processor.openOrdersMux.Unlock()
+}
+
+func (processor *FollowTheLeaderProcessor) buildLeaderBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest) {
+	// Get latest stale order
+	processor.openOrdersMux.RLock()
+	staleOrder := processor.staleOrders[len(processor.staleOrders)-1]
+	processor.openOrdersMux.RUnlock()
+
+	// Build the appropriate trending order based on the stale order
+	if staleOrder.Side == "BUY" {
+		buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
+	} else {
+		buyRequest, sellRequest = processor.buildUpwardTrendingOrders(data)
+	}
+	return buyRequest, sellRequest
+}
+
+func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest, err error) {
+	// Get trix indicator
+	movingAverage, trix, err := processor.symbol.GetCurrentTrixIndicator("1m", 5)
+	if err != nil {
+		log.WithError(err).Error("could not get TRIX indicator")
+		return
+	}
+
+	// If trix is positive, the price is increasing
+	if trix > 0 {
+		// If the current price is greater than the moving average, the trend should be continuing upward
+		if data.CurrentClosePrice.GreaterThan(decimal.NewFromFloat(movingAverage)) {
+			// Place upward trend orders
+			buyRequest, sellRequest = processor.buildUpwardTrendingOrders(data)
+		} else { // Things have gotten too unpredictable. Bail.
+			err = errors.New("skipping unpredictable upward trend")
+			return
+		}
+	} else {
+		// If the current price is less than the moving average, the trend should be continuing downward
+		if data.CurrentClosePrice.LessThan(decimal.NewFromFloat(movingAverage)) {
+			// Place downward trend orders
+			buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
+		} else { // Things have gotten too unpredictable. Bail.
+			err = errors.New("skipping unpredictable downward trend")
+			return
+		}
+	}
+
+	return buyRequest, sellRequest, err
+}
+
+func (processor *FollowTheLeaderProcessor) buildUpwardTrendingOrders(data binance.SymbolTickerData) (buyOrder coinfactory.OrderRequest, sellOrder coinfactory.OrderRequest) {
+	// Target spread is the trade fee + percent return target
+	targetSpread := tradeFee.Add(decimal.NewFromFloat(viper.GetFloat64("followtheleaderprocessor.percentReturnTarget")))
+
+	// Base quantity is the average quantity per trade
+	baseQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
+
+	// Buy price based on current asking price
+	buyPrice := data.AskPrice
+
+	// Sell price based on current asking price plus target spread
+	sellPrice := data.AskPrice.Add(data.AskPrice.Mul(targetSpread))
+
+	// Buy quantity is double the base quantity
+	buyQty := baseQty.Add(baseQty)
+
+	// Sell quantity is adjusted to give return on both currencies
+	sellQty := baseQty.Mul(buyPrice).Div(sellPrice).Add(baseQty)
+
+	buyOrder = coinfactory.OrderRequest{
+		Symbol:   processor.symbol.Symbol,
+		Side:     "BUY",
+		Quantity: buyQty,
+		Price:    buyPrice,
+	}
+
+	sellOrder = coinfactory.OrderRequest{
+		Symbol:   processor.symbol.Symbol,
+		Side:     "SELL",
+		Quantity: sellQty,
+		Price:    sellPrice,
+	}
+
+	return buyOrder, sellOrder
+}
+
+func (processor *FollowTheLeaderProcessor) buildDownwardTrendingOrders(data binance.SymbolTickerData) (buyOrder coinfactory.OrderRequest, sellOrder coinfactory.OrderRequest) {
+	// Target spread is the trade fee + percent return target
+	targetSpread := tradeFee.Add(decimal.NewFromFloat(viper.GetFloat64("followtheleaderprocessor.percentReturnTarget")))
+
+	// Base quantity is the average quantity per trade
+	baseQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
+
+	// Buy price is based on the current bid price less the target spread
+	buyPrice := data.BidPrice.Div(decimal.NewFromFloat(1).Add(targetSpread))
+
+	// Sell price is based on the current bid price
+	sellPrice := data.BidPrice
+
+	// Buy quantity is double the base quantity
+	buyQty := baseQty.Add(baseQty)
+
+	// Sell quantity is adjusted to give return on both currencies
+	sellQty := baseQty.Mul(buyPrice).Div(sellPrice).Add(baseQty)
+
+	buyOrder = coinfactory.OrderRequest{
+		Symbol:   processor.symbol.Symbol,
+		Side:     "BUY",
+		Quantity: buyQty,
+		Price:    buyPrice,
+	}
+
+	sellOrder = coinfactory.OrderRequest{
+		Symbol:   processor.symbol.Symbol,
+		Side:     "SELL",
+		Quantity: sellQty,
+		Price:    sellPrice,
+	}
+
+	return buyOrder, sellOrder
+}
+
+func (processor *FollowTheLeaderProcessor) isReady() bool {
+	processor.openOrdersMux.RLock()
+	defer processor.openOrdersMux.RUnlock()
+	return len(processor.openOrders) == 0
+}
+
+func (processor *FollowTheLeaderProcessor) startJanitor() {
+	log.Info("Order janitor started successfully")
+	timer := time.NewTicker(15 * time.Second)
+
+	// Intercept the interrupt signal and pass it along
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	// Start the loop
+	for {
+		select {
+		case <-timer.C:
+			processor.openOrdersMux.Lock()
+			processor.pruneOpenOrders()
+			processor.cancelExpiredStaleOrders()
+			processor.openOrdersMux.Unlock()
+		case <-interrupt:
+			processor.janitorQuitChannel <- true
+		case <-processor.janitorQuitChannel:
+			return
+		}
+	}
+}
+
+func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
+	log.Debug("Pruning open orders")
+	openOrders := []*coinfactory.Order{}
+	for _, o := range processor.openOrders {
+		// Remove any closed orders
+		switch o.GetStatus().Status {
+		// Skip this cases
+		case "NEW":
+		case "PARTIALLY_FILLED":
+		case "PENDING_CANCEL":
+		case "":
+		// Delete the rest
+		default:
+			log.WithField("order", o).Debug("Removing closed order")
+			continue
+		}
+
+		// Remove stale orders
+		if o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.markOrderAsStaleAfter").Nanoseconds() {
+			// Don't prune if both orders are still open
+			if len(processor.openOrders) == 2 {
+				openOrders = append(openOrders, o)
+				continue
+			}
+
+			// Mark order as stale
+			log.WithField("order", o).Debug("Marking order as stale")
+			processor.staleOrders = append(processor.staleOrders, o)
+			continue
+		}
+
+		openOrders = append(openOrders, o)
+	}
+
+	processor.openOrders = openOrders
+}
+
+func (processor *FollowTheLeaderProcessor) cancelExpiredStaleOrders() {
+	staleOrders := []*coinfactory.Order{}
+	for _, o := range processor.staleOrders {
+		// Cancel expired orders
+		if o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.cancelOrderAfter").Nanoseconds() {
+			log.WithField("order", o).Debug("Cancelling expired order")
+			go cancelOrder(o)
+			continue
+		}
+		staleOrders = append(staleOrders, o)
+	}
+	processor.staleOrders = staleOrders
 }

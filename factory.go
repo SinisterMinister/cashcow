@@ -18,3 +18,15 @@ func newSpreadPlayerProcessor(symbol *coinfactory.Symbol) coinfactory.SymbolStre
 	proc.startOpenOrderJanitor()
 	return &proc
 }
+
+func newFollowTheLeaderProcessor(symbol *coinfactory.Symbol) coinfactory.SymbolStreamProcessor {
+	proc := FollowTheLeaderProcessor{
+		symbol:             symbol,
+		openOrders:         []*coinfactory.Order{},
+		staleOrders:        []*coinfactory.Order{},
+		janitorQuitChannel: make(chan bool),
+		openOrdersMux:      &sync.RWMutex{},
+	}
+	proc.init()
+	return &proc
+}
