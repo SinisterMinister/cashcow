@@ -112,6 +112,28 @@ func executeOrders(buy coinfactory.OrderRequest, sell coinfactory.OrderRequest) 
 	return buyOrder, sellOrder, nil
 }
 
+func executeOrdersSequentially(buy coinfactory.OrderRequest, sell coinfactory.OrderRequest) (*coinfactory.Order, *coinfactory.Order, error) {
+	buyOrder, err := cf.GetOrderManager().AttemptOrder(buy)
+	if err != nil {
+		log.WithError(err).Error("Could not place order!")
+		return &coinfactory.Order{}, &coinfactory.Order{}, err
+	}
+
+	sellOrder, err0 := cf.GetOrderManager().AttemptOrder(sell)
+	if err0 != nil {
+		log.WithError(err0).Error("Could not place order! Cancelling previous order")
+		// Cancel buy order
+		err1 := cf.GetOrderManager().CancelOrder(buyOrder)
+		if err1 != nil {
+			log.WithError(err1).Error("Could not cancel previous order!")
+			return &coinfactory.Order{}, &coinfactory.Order{}, err1
+		}
+		return &coinfactory.Order{}, &coinfactory.Order{}, err0
+	}
+
+	return buyOrder, sellOrder, nil
+}
+
 func logTicker(data binance.SymbolTickerData) {
 	// askPercent := data.AskPrice.Sub(data.BidPrice).Div(data.AskPrice)
 	// bidPercent := data.AskPrice.Sub(data.BidPrice).Div(data.BidPrice)
@@ -119,8 +141,8 @@ func logTicker(data binance.SymbolTickerData) {
 
 func adjustOrdersQuantityBasedOnAvailableFunds(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.OrderRequest, symbol *coinfactory.Symbol) {
 	// Check balances and adjust quantity if necessary
-	quoteBalance := cf.GetBalanceManager().GetAvailableBalance(symbol.QuoteAsset)
-	baseBalance := cf.GetBalanceManager().GetAvailableBalance(symbol.BaseAsset)
+	quoteBalance := cf.GetBalanceManager().GetUsableBalance(symbol.QuoteAsset)
+	baseBalance := cf.GetBalanceManager().GetUsableBalance(symbol.BaseAsset)
 
 	log.WithFields(log.Fields{
 		symbol.BaseAsset:  baseBalance,

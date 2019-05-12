@@ -15,7 +15,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var tradeFee = decimal.NewFromFloat(0.001)
+var tradeFee = decimal.NewFromFloat(0.0015)
 
 type SpreadPlayerProcessor struct {
 	symbol             *coinfactory.Symbol
@@ -27,7 +27,7 @@ type SpreadPlayerProcessor struct {
 
 func (p *SpreadPlayerProcessor) ProcessData(data binance.SymbolTickerData) {
 	if len(p.openOrders) == 0 && isViable(data) {
-		go p.placeCombinedOrder(data)
+		go p.placeCombinedTestOrder(data)
 	}
 }
 
@@ -344,11 +344,22 @@ func (processor *FollowTheLeaderProcessor) ProcessData(data binance.SymbolTicker
 }
 
 func (processor *FollowTheLeaderProcessor) init() {
+	// Get open orders
+	orders, err := cf.GetOrderManager().GetOpenOrders(processor.symbol)
+	if err != nil {
+		log.WithError(err).Error("could not fetch open orders")
+	}
+	processor.openOrdersMux.Lock()
+	processor.openOrders = orders
+	processor.openOrdersMux.Unlock()
 	go processor.startJanitor()
 }
 
 func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTickerData) {
-	var buyRequest, sellRequest coinfactory.OrderRequest
+	var (
+		buyRequest, sellRequest coinfactory.OrderRequest
+		buyFirst                bool
+	)
 
 	// Get count of stale orders
 	processor.openOrdersMux.RLock()
@@ -358,15 +369,16 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 	// If stale orders exist, use them as the leader to follow, otherwise use trix
 	if numStaleOrders > 0 {
 		// Throttle based on stalled orders
-		if numStaleOrders < 3 {
+		if numStaleOrders >= viper.GetInt("followtheleaderprocessor.maxStaleOrders") {
 			log.Warn("throttling due to too many stale orders")
 			return
 		}
-		buyRequest, sellRequest = processor.buildLeaderBasedOrderRequests(data)
+
+		buyRequest, sellRequest, buyFirst = processor.buildLeaderBasedOrderRequests(data)
 	} else {
 		// Get TRIX based orders
 		var err error
-		buyRequest, sellRequest, err = processor.buildTrixBasedOrderRequests(data)
+		buyRequest, sellRequest, buyFirst, err = processor.buildTrixBasedOrderRequests(data)
 		if err != nil {
 			log.WithError(err).Error("could not build trix based order requests")
 			return
@@ -384,34 +396,74 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		return
 	}
 
-	buyOrder, sellOrder, err := executeOrders(buyRequest, sellRequest)
-	if err != nil {
-		// Nothing to do
-		return
-	}
+	go func() {
+		var request0, request1 coinfactory.OrderRequest
+		if buyFirst {
+			request0 = buyRequest
+			request1 = sellRequest
+		} else {
+			request0 = sellRequest
+			request1 = buyRequest
+		}
 
-	processor.openOrdersMux.Lock()
-	processor.openOrders = append(processor.openOrders, buyOrder)
-	processor.openOrders = append(processor.openOrders, sellOrder)
-	processor.openOrdersMux.Unlock()
+		order0, err := cf.GetOrderManager().AttemptOrder(request0)
+		if err != nil {
+			log.WithError(err).Error("Could not place order!")
+			// Nothing to do
+			return
+		}
+
+		// Lock up the funds for the second order
+		funds := request1.Price.Mul(request1.Quantity)
+		cf.GetBalanceManager().AddReservedBalance(request1.Symbol, funds)
+
+		processor.openOrdersMux.Lock()
+		processor.openOrders = append(processor.openOrders, order0)
+		processor.openOrdersMux.Unlock()
+
+		select {
+		case <-order0.GetDoneChan():
+		}
+		processor.pruneOpenOrders()
+
+		order1, err := cf.GetOrderManager().AttemptOrder(request1)
+		if err != nil {
+			log.WithError(err).Error("Could not place order!")
+			// Nothing to do
+			return
+		}
+		cf.GetBalanceManager().SubReservedBalance(request1.Symbol, funds)
+
+		processor.openOrdersMux.Lock()
+		processor.openOrders = append(processor.openOrders, order1)
+		processor.openOrdersMux.Unlock()
+
+		select {
+		case <-order1.GetDoneChan():
+		}
+		processor.pruneOpenOrders()
+	}()
 }
 
-func (processor *FollowTheLeaderProcessor) buildLeaderBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest) {
+func (processor *FollowTheLeaderProcessor) buildLeaderBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest, buyFirst bool) {
 	// Get latest stale order
 	processor.openOrdersMux.RLock()
-	staleOrder := processor.staleOrders[len(processor.staleOrders)-1]
+	staleOrderCount := len(processor.staleOrders)
+	staleOrder := processor.staleOrders[staleOrderCount-1]
 	processor.openOrdersMux.RUnlock()
 
 	// Build the appropriate trending order based on the stale order
 	if staleOrder.Side == "BUY" {
-		buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
-	} else {
 		buyRequest, sellRequest = processor.buildUpwardTrendingOrders(data)
+		buyFirst = true
+	} else {
+		buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
+		buyFirst = false
 	}
-	return buyRequest, sellRequest
+	return buyRequest, sellRequest, buyFirst
 }
 
-func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest, err error) {
+func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data binance.SymbolTickerData) (buyRequest coinfactory.OrderRequest, sellRequest coinfactory.OrderRequest, buyFirst bool, err error) {
 	// Get trix indicator
 	movingAverage, trix, err := processor.symbol.GetCurrentTrixIndicator("1m", 5)
 	if err != nil {
@@ -425,6 +477,7 @@ func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data bina
 		if data.CurrentClosePrice.GreaterThan(decimal.NewFromFloat(movingAverage)) {
 			// Place upward trend orders
 			buyRequest, sellRequest = processor.buildUpwardTrendingOrders(data)
+			buyFirst = true
 		} else { // Things have gotten too unpredictable. Bail.
 			err = errors.New("skipping unpredictable upward trend")
 			return
@@ -434,13 +487,14 @@ func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data bina
 		if data.CurrentClosePrice.LessThan(decimal.NewFromFloat(movingAverage)) {
 			// Place downward trend orders
 			buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
+			buyFirst = false
 		} else { // Things have gotten too unpredictable. Bail.
 			err = errors.New("skipping unpredictable downward trend")
 			return
 		}
 	}
 
-	return buyRequest, sellRequest, err
+	return buyRequest, sellRequest, buyFirst, err
 }
 
 func (processor *FollowTheLeaderProcessor) buildUpwardTrendingOrders(data binance.SymbolTickerData) (buyOrder coinfactory.OrderRequest, sellOrder coinfactory.OrderRequest) {
@@ -523,6 +577,8 @@ func (processor *FollowTheLeaderProcessor) isReady() bool {
 
 func (processor *FollowTheLeaderProcessor) startJanitor() {
 	log.Info("Order janitor started successfully")
+	// Clean up orphaned orders
+	processor.cleanUpOrders()
 	timer := time.NewTicker(15 * time.Second)
 
 	// Intercept the interrupt signal and pass it along
@@ -533,16 +589,20 @@ func (processor *FollowTheLeaderProcessor) startJanitor() {
 	for {
 		select {
 		case <-timer.C:
-			processor.openOrdersMux.Lock()
-			processor.pruneOpenOrders()
-			processor.cancelExpiredStaleOrders()
-			processor.openOrdersMux.Unlock()
+			processor.cleanUpOrders()
 		case <-interrupt:
 			processor.janitorQuitChannel <- true
 		case <-processor.janitorQuitChannel:
 			return
 		}
 	}
+}
+
+func (processor *FollowTheLeaderProcessor) cleanUpOrders() {
+	processor.openOrdersMux.Lock()
+	processor.cancelExpiredStaleOrders()
+	processor.pruneOpenOrders()
+	processor.openOrdersMux.Unlock()
 }
 
 func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
@@ -564,14 +624,9 @@ func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
 
 		// Remove stale orders
 		if o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.markOrderAsStaleAfter").Nanoseconds() {
-			// Don't prune if both orders are still open
-			if len(processor.openOrders) == 2 {
-				openOrders = append(openOrders, o)
-				continue
-			}
 
 			// Mark order as stale
-			log.WithField("order", o).Debug("Marking order as stale")
+			log.WithField("order", o).Info("Marking order as stale")
 			processor.staleOrders = append(processor.staleOrders, o)
 			continue
 		}

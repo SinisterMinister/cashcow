@@ -39,4 +39,5 @@ func setDefaultConfigValues() {
 	viper.SetDefault("followtheleaderprocessor.fallbackQuantityBalancePercent", .20)
 	viper.SetDefault("followtheleaderprocessor.markOrderAsStaleAfter", "1m")
 	viper.SetDefault("followtheleaderprocessor.cancelOrderAfter", "4h")
+	viper.SetDefault("followtheleaderprocessor.maxStaleOrders", 4)
 }
