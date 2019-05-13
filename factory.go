@@ -26,6 +26,7 @@ func newFollowTheLeaderProcessor(symbol *coinfactory.Symbol) coinfactory.SymbolS
 		staleOrders:        []*coinfactory.Order{},
 		janitorQuitChannel: make(chan bool),
 		openOrdersMux:      &sync.RWMutex{},
+		readyMutex:         &sync.RWMutex{},
 	}
 	proc.init()
 	return &proc

@@ -330,6 +330,8 @@ type FollowTheLeaderProcessor struct {
 	staleOrders        []*coinfactory.Order
 	janitorQuitChannel chan bool
 	openOrdersMux      *sync.RWMutex
+	readyMutex         *sync.RWMutex
+	working            bool
 }
 
 func (processor *FollowTheLeaderProcessor) ProcessData(data binance.SymbolTickerData) {
@@ -355,11 +357,29 @@ func (processor *FollowTheLeaderProcessor) init() {
 	go processor.startJanitor()
 }
 
+func (processor *FollowTheLeaderProcessor) lockProcessor() {
+	processor.readyMutex.Lock()
+	processor.working = true
+	processor.readyMutex.Unlock()
+}
+
+func (processor *FollowTheLeaderProcessor) unlockProcessor() {
+	processor.readyMutex.Lock()
+	processor.working = false
+	processor.readyMutex.Unlock()
+}
+
 func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTickerData) {
 	var (
 		buyRequest, sellRequest coinfactory.OrderRequest
 		buyFirst                bool
 	)
+
+	// Lock the processor while we work
+	processor.lockProcessor()
+
+	// Unlock when we're finished
+	defer processor.unlockProcessor()
 
 	// Get count of stale orders
 	processor.openOrdersMux.RLock()
@@ -577,9 +597,17 @@ func (processor *FollowTheLeaderProcessor) buildDownwardTrendingOrders(data bina
 }
 
 func (processor *FollowTheLeaderProcessor) isReady() bool {
+	processor.readyMutex.RLock()
+	defer processor.readyMutex.RUnlock()
+	if processor.working {
+		return false
+	}
 	processor.openOrdersMux.RLock()
 	defer processor.openOrdersMux.RUnlock()
-	return len(processor.openOrders) == 0
+	if len(processor.openOrders) > 0 {
+		return false
+	}
+	return true
 }
 
 func (processor *FollowTheLeaderProcessor) startJanitor() {
