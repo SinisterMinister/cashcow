@@ -370,7 +370,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 	if numStaleOrders > 0 {
 		// Throttle based on stalled orders
 		if numStaleOrders >= viper.GetInt("followtheleaderprocessor.maxStaleOrders") {
-			log.Warn("throttling due to too many stale orders")
+			log.Debug("throttling due to too many stale orders")
 			return
 		}
 
@@ -425,6 +425,13 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		case <-order0.GetDoneChan():
 		}
 		processor.pruneOpenOrders()
+
+		// Don't do the next order if this one was canceled
+		if order0.GetStatus().Status == "CANCELED" {
+			log.Warn("first ordered canceled. skipping second order")
+			cf.GetBalanceManager().SubReservedBalance(request1.Symbol, funds)
+			return
+		}
 
 		order1, err := cf.GetOrderManager().AttemptOrder(request1)
 		if err != nil {
@@ -626,7 +633,7 @@ func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
 		if o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.markOrderAsStaleAfter").Nanoseconds() {
 
 			// Mark order as stale
-			log.WithField("order", o).Info("Marking order as stale")
+			log.WithField("order", o).Warn("Marking order as stale")
 			processor.staleOrders = append(processor.staleOrders, o)
 			continue
 		}
