@@ -453,13 +453,13 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			return
 		}
 
+		cf.GetBalanceManager().SubReservedBalance(request1.Symbol, funds)
 		order1, err := cf.GetOrderManager().AttemptOrder(request1)
 		if err != nil {
 			log.WithError(err).Error("Could not place order!")
 			// Nothing to do
 			return
 		}
-		cf.GetBalanceManager().SubReservedBalance(request1.Symbol, funds)
 
 		processor.openOrdersMux.Lock()
 		processor.openOrders = append(processor.openOrders, order1)
