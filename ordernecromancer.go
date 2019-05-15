@@ -1,35 +1,21 @@
 package main
 
 import (
-	"os"
 	"sync"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/sinisterminister/coinfactory"
+	"github.com/spf13/viper"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	scribble "github.com/nanobox-io/golang-scribble"
 )
 
-type orderMorgue struct {
-	BuyOrders  []coinfactory.OrderRequest
-	SellOrders []coinfactory.OrderRequest
-}
-
-type orderCoffin struct {
-	Key string `json:"key"`
-	coinfactory.OrderRequest
-}
-
-func createOrderCoffin(order coinfactory.OrderRequest) orderCoffin {
-	return orderCoffin{order.Symbol + order.Side, order}
-}
-
 type orderNecromancer struct {
-	deadOrders map[string]orderMorgue
-	db         *dynamodb.DynamoDB
+	db    *scribble.Driver
+	mutex *sync.Mutex
 }
 
 var orderNecromancerOnce = sync.Once{}
@@ -37,21 +23,15 @@ var orderNecromancerInstance *orderNecromancer
 
 func getOrderNecromancerInstance() *orderNecromancer {
 	orderNecromancerOnce.Do(func() {
-		// Tell AWS to use the credentials file for region
-		os.Setenv("AWS_SDK_LOAD_CONFIG", "true")
 
-		// Get an AWS session
-		sess, err := session.NewSession(&aws.Config{})
+		db, err := scribble.New(viper.GetString("scribbledb.dir"), nil)
 		if err != nil {
-			log.Fatal("Could not get AWS session")
+			log.WithError(err).Panic("cannot start scribble database")
 		}
 
-		// Create DynamoDB client
-		svc := dynamodb.New(sess)
-
 		orderNecromancerInstance = &orderNecromancer{
-			db:         svc,
-			deadOrders: make(map[string]orderMorgue),
+			db:    db,
+			mutex: &sync.Mutex{},
 		}
 
 	})
@@ -59,12 +39,76 @@ func getOrderNecromancerInstance() *orderNecromancer {
 	return orderNecromancerInstance
 }
 
-func (n *orderNecromancer) fetchDeadOrders() {}
+func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
+	// First, create an order request
+	req := coinfactory.OrderRequest{
+		Symbol:   order.Symbol,
+		Side:     order.Side,
+		Price:    order.Price,
+		Quantity: order.GetStatus().OriginalQuantity.Sub(order.GetStatus().ExecutedQuantity),
+	}
 
-func (n *orderNecromancer) collectOrder(order *coinfactory.Order) {}
+	// Lock the data for writing
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
 
-// func (n *orderNecromancer) recordOrder(coffin orderCoffin) error {}
+	// Add it and save it to the order collection
+	orders := []coinfactory.OrderRequest{}
+	err = o.db.Read("deadorders", order.Symbol, orders)
+	if err != nil {
+		log.Debug("could not load previous orders. starting new")
+	}
 
-// func (n *orderNecromancer) purgeOrder(coffin orderCoffin) {}
+	orders = append(orders, req)
+	err = o.db.Write("deadorders", order.Symbol, orders)
+	return
+}
 
-// func (n *orderNecromancer) updateOrder(coffin orderCoffin) error {}
+func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, bid decimal.Decimal) (orders []*coinfactory.Order) {
+	// Lock everything until we're done
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	// Load the orders
+	orderReq := []coinfactory.OrderRequest{}
+	allOrders := []coinfactory.OrderRequest{}
+	savedOrders := []coinfactory.OrderRequest{}
+	err := o.db.Read("deadorders", symbol, allOrders)
+	if err != nil {
+		return
+	}
+
+	for _, req := range allOrders {
+		if (req.Side == "BUY" && req.Price.GreaterThanOrEqual(ask)) || (req.Side == "SELL" && req.Price.LessThanOrEqual(bid)) {
+			orderReq = append(orderReq, req)
+			continue
+		}
+		savedOrders = append(savedOrders, req)
+	}
+
+	for _, req := range orderReq {
+		// Attempt to place the order
+		order, err := cf.GetOrderManager().AttemptOrder(req)
+		if err != nil {
+			log.WithField("order", req).WithError(err).Info("could not resurrect order")
+			savedOrders = append(savedOrders, req)
+			continue
+		}
+
+		go func() {
+			<-order.GetDoneChan()
+			if order.GetStatus().Status == "CANCELED" {
+				o.BuryOrder(order)
+			}
+		}()
+
+		orders = append(orders, order)
+	}
+
+	err = o.db.Write("deadorders", symbol, savedOrders)
+	if err != nil {
+		log.WithError(err).Error("could not save dead orders after resurrection")
+	}
+
+	return
+}

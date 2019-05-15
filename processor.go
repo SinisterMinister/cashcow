@@ -335,6 +335,14 @@ type FollowTheLeaderProcessor struct {
 }
 
 func (processor *FollowTheLeaderProcessor) ProcessData(data binance.SymbolTickerData) {
+	// Resurrect dead orders if possible
+	go func() {
+		orders := getOrderNecromancerInstance().ResurrectOrders(data.Symbol, data.AskPrice, data.BidPrice)
+		processor.openOrdersMux.Lock()
+		defer processor.openOrdersMux.Unlock()
+		processor.openOrders = append(processor.openOrders, orders...)
+	}()
+
 	// Check if ready for data
 	if !processor.isReady() {
 		// Not ready. Skip.
@@ -441,9 +449,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		processor.openOrders = append(processor.openOrders, order0)
 		processor.openOrdersMux.Unlock()
 
-		select {
-		case <-order0.GetDoneChan():
-		}
+		<-order0.GetDoneChan()
 		processor.pruneOpenOrders()
 
 		// Don't do the next order if this one was canceled
@@ -465,8 +471,10 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		processor.openOrders = append(processor.openOrders, order1)
 		processor.openOrdersMux.Unlock()
 
-		select {
-		case <-order1.GetDoneChan():
+		<-order1.GetDoneChan()
+		// If canceled, give to order necromancer to handle
+		if order1.GetStatus().Status == "CANCELED" {
+			getOrderNecromancerInstance().BuryOrder(order1)
 		}
 		processor.pruneOpenOrders()
 	}()

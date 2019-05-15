@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/ioutil"
 	"os"
 	"os/signal"
 
@@ -40,4 +41,12 @@ func setDefaultConfigValues() {
 	viper.SetDefault("followtheleaderprocessor.markOrderAsStaleAfter", "1m")
 	viper.SetDefault("followtheleaderprocessor.cancelOrderAfter", "4h")
 	viper.SetDefault("followtheleaderprocessor.maxStaleOrders", 4)
+
+	// Setup tempdir
+	dir, err := ioutil.TempDir("", "cashcow")
+	if err != nil {
+		dir = os.TempDir()
+	}
+
+	viper.SetDefault("scribbledb.dir", dir)
 }
