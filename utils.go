@@ -43,7 +43,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 		log.WithFields(log.Fields{
 			"buy":  buy,
 			"sell": sell,
-		}).Warn("Skipping zero value order")
+		}).Debug("Skipping zero value order")
 		return false
 	}
 
@@ -58,7 +58,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 		log.WithFields(log.Fields{
 			"buy":  buy,
 			"sell": sell,
-		}).Warn("Skipping negative return order")
+		}).Debug("Skipping negative return order")
 		return false
 	}
 
@@ -70,7 +70,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 			"buy":  buy,
 			"sell": sell,
 			"mn":   mn,
-		}).Warn("Skipping sub-notional order")
+		}).Debug("Skipping sub-notional order")
 		return false
 	}
 

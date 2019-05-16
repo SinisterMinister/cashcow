@@ -70,7 +70,7 @@ func cancelExpiredStaleOrders(p *SpreadPlayerProcessor) {
 	for _, o := range p.staleOrders {
 		// Cancel expired orders
 		if o.GetAge().Nanoseconds() > viper.GetDuration("spreadprocessor.cancelOrderAfter").Nanoseconds() {
-			log.WithField("order", o).Debug("Cancelling expired order")
+			log.WithField("order", o).Warn("Cancelling expired order")
 			go cancelOrder(o)
 			continue
 		}
@@ -82,6 +82,10 @@ func cancelExpiredStaleOrders(p *SpreadPlayerProcessor) {
 func cancelOrder(o *coinfactory.Order) {
 	err := cf.GetOrderManager().CancelOrder(o)
 	if err != nil {
-		log.WithError(err).Error("Could not cancel expired order")
+		if o.GetStatus().Status != "CANCELED" {
+			log.WithError(err).Error("Could not cancel expired order")
+			// Try again but bail if it fail
+			cf.GetOrderManager().CancelOrder(o)
+		}
 	}
 }

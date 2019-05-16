@@ -17,6 +17,14 @@ import (
 
 var tradeFee = decimal.NewFromFloat(0.0015)
 
+type UnstableTradeConditionError struct {
+	msg string
+}
+
+func (err UnstableTradeConditionError) Error() string {
+	return err.msg
+}
+
 type SpreadPlayerProcessor struct {
 	symbol             *coinfactory.Symbol
 	openOrders         []*coinfactory.Order
@@ -408,7 +416,12 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		var err error
 		buyRequest, sellRequest, buyFirst, err = processor.buildTrixBasedOrderRequests(data)
 		if err != nil {
-			log.WithError(err).Error("could not build trix based order requests")
+			if e, ok := err.(UnstableTradeConditionError); ok {
+				log.WithError(e).Debug("order bailed")
+			} else {
+				log.WithError(err).Error("could not build trix based order requests")
+			}
+
 			return
 		}
 	}
@@ -474,7 +487,11 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		<-order1.GetDoneChan()
 		// If canceled, give to order necromancer to handle
 		if order1.GetStatus().Status == "CANCELED" {
-			getOrderNecromancerInstance().BuryOrder(order1)
+			log.WithField("order", order1).Info("order canceled. sending to necromancer for burial")
+			oerr := getOrderNecromancerInstance().BuryOrder(order1)
+			if oerr != nil {
+				log.WithError(oerr).Error("could not burry order")
+			}
 		}
 		processor.pruneOpenOrders()
 	}()
@@ -514,7 +531,7 @@ func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data bina
 			buyRequest, sellRequest = processor.buildUpwardTrendingOrders(data)
 			buyFirst = true
 		} else { // Things have gotten too unpredictable. Bail.
-			err = errors.New("skipping unpredictable upward trend")
+			err = UnstableTradeConditionError{"skipping unpredictable upward trend"}
 			return
 		}
 	} else {
@@ -524,7 +541,7 @@ func (processor *FollowTheLeaderProcessor) buildTrixBasedOrderRequests(data bina
 			buyRequest, sellRequest = processor.buildDownwardTrendingOrders(data)
 			buyFirst = false
 		} else { // Things have gotten too unpredictable. Bail.
-			err = errors.New("skipping unpredictable downward trend")
+			err = UnstableTradeConditionError{"skipping unpredictable downward trend"}
 			return
 		}
 	}
@@ -685,7 +702,7 @@ func (processor *FollowTheLeaderProcessor) cancelExpiredStaleOrders() {
 	for _, o := range processor.staleOrders {
 		// Cancel expired orders
 		if o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.cancelOrderAfter").Nanoseconds() {
-			log.WithField("order", o).Debug("Cancelling expired order")
+			log.WithField("order", o).Warn("Cancelling expired order")
 			go cancelOrder(o)
 			continue
 		}
