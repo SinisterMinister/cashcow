@@ -486,7 +486,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 
 		<-order1.GetDoneChan()
 		// If canceled, give to order necromancer to handle
-		if order1.GetStatus().Status == "CANCELED" {
+		if order1.GetStatus().Status == "CANCELED" || order1.GetStatus().Status == "PARTIALLY_FILLED" {
 			log.WithField("order", order1).Info("order canceled. sending to necromancer for burial")
 			oerr := getOrderNecromancerInstance().BuryOrder(order1)
 			if oerr != nil {

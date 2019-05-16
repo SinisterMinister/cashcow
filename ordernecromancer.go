@@ -54,7 +54,7 @@ func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
 
 	// Add it and save it to the order collection
 	orders := []coinfactory.OrderRequest{}
-	err = o.db.Read("deadorders", order.Symbol, orders)
+	err = o.db.Read("deadorders", order.Symbol, &orders)
 	if err != nil {
 		log.Debug("could not load previous orders. starting new")
 	}
@@ -73,7 +73,7 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 	orderReq := []coinfactory.OrderRequest{}
 	allOrders := []coinfactory.OrderRequest{}
 	savedOrders := []coinfactory.OrderRequest{}
-	err := o.db.Read("deadorders", symbol, allOrders)
+	err := o.db.Read("deadorders", symbol, &allOrders)
 	if err != nil {
 		return
 	}
@@ -90,7 +90,7 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 		// Attempt to place the order
 		order, err := cf.GetOrderManager().AttemptOrder(req)
 		if err != nil {
-			log.WithField("order", req).WithError(err).Info("could not resurrect order")
+			log.WithField("order", req).WithError(err).Warn("could not resurrect order")
 			savedOrders = append(savedOrders, req)
 			continue
 		}
