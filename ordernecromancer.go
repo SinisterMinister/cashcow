@@ -39,6 +39,23 @@ func getOrderNecromancerInstance() *orderNecromancer {
 	return orderNecromancerInstance
 }
 
+func (o *orderNecromancer) buryRequest(req coinfactory.OrderRequest) (err error) {
+	// Lock the data for writing
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	// Add it and save it to the order collection
+	orders := []coinfactory.OrderRequest{}
+	err = o.db.Read("deadorders", req.Symbol, &orders)
+	if err != nil {
+		log.Debug("could not load previous orders. starting new")
+	}
+
+	orders = append(orders, req)
+	err = o.db.Write("deadorders", req.Symbol, orders)
+	return
+}
+
 func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
 	// First, create an order request
 	req := coinfactory.OrderRequest{
@@ -48,33 +65,21 @@ func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
 		Quantity: order.GetStatus().OriginalQuantity.Sub(order.GetStatus().ExecutedQuantity),
 	}
 
-	// Lock the data for writing
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
+	o.buryRequest(req)
 
-	// Add it and save it to the order collection
-	orders := []coinfactory.OrderRequest{}
-	err = o.db.Read("deadorders", order.Symbol, &orders)
-	if err != nil {
-		log.Debug("could not load previous orders. starting new")
-	}
-
-	orders = append(orders, req)
-	err = o.db.Write("deadorders", order.Symbol, orders)
 	return
 }
 
 func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, bid decimal.Decimal) (orders []*coinfactory.Order) {
-	// Lock everything until we're done
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
 	// Load the orders
 	orderReq := []coinfactory.OrderRequest{}
 	allOrders := []coinfactory.OrderRequest{}
 	savedOrders := []coinfactory.OrderRequest{}
+
+	o.mutex.Lock()
 	err := o.db.Read("deadorders", symbol, &allOrders)
 	if err != nil {
+		o.mutex.Unlock()
 		return
 	}
 
@@ -86,28 +91,46 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 		savedOrders = append(savedOrders, req)
 	}
 
-	for _, req := range orderReq {
-		// Attempt to place the order
-		order, err := cf.GetOrderManager().AttemptOrder(req)
-		if err != nil {
-			log.WithField("order", req).WithError(err).Warn("could not resurrect order")
-			savedOrders = append(savedOrders, req)
-			continue
-		}
-
-		go func() {
-			<-order.GetDoneChan()
-			if order.GetStatus().Status == "CANCELED" {
-				o.BuryOrder(order)
-			}
-		}()
-
-		orders = append(orders, order)
-	}
-
 	err = o.db.Write("deadorders", symbol, savedOrders)
 	if err != nil {
 		log.WithError(err).Error("could not save dead orders after resurrection")
+	}
+
+	o.mutex.Unlock()
+
+	orderChan := make(chan *coinfactory.Order)
+	loopDoneChan := make(chan bool)
+
+	go func() {
+		for _, req := range orderReq {
+			// Attempt to place the order
+			order, err := cf.GetOrderManager().AttemptOrder(req)
+			if err != nil {
+				log.WithField("order", req).WithError(err).Warn("could not resurrect order")
+				o.buryRequest(req)
+				continue
+			}
+
+			orderChan <- order
+
+			go func() {
+				<-order.GetDoneChan()
+				if order.GetStatus().Status == "CANCELED" {
+					o.BuryOrder(order)
+				}
+			}()
+		}
+		close(loopDoneChan)
+	}()
+
+orderLoop:
+	for {
+		select {
+		case o := <-orderChan:
+			orders = append(orders, o)
+		case <-loopDoneChan:
+			break orderLoop
+		}
 	}
 
 	return

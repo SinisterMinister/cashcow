@@ -50,7 +50,7 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 	// Validate the orders are still viable
 	bv := buy.Price.Mul(buy.Quantity)
 	sv := sell.Price.Mul(sell.Quantity)
-	tc := bv.Mul(tradeFee).Add(sv.Mul(tradeFee))
+	tc := bv.Mul(takerFee).Add(sv.Mul(makerFee))
 	r := sv.Sub(bv)
 
 	// Bail out if we make no money
@@ -170,4 +170,28 @@ func normalizeOrders(buyOrder *coinfactory.OrderRequest, sellOrder *coinfactory.
 	// Normalize quantities
 	buyOrder.Quantity = normalizeQuantity(buyOrder.Quantity, symbol)
 	sellOrder.Quantity = normalizeQuantity(sellOrder.Quantity, symbol)
+}
+
+func isOrderOpen(o *coinfactory.Order) (open bool) {
+	// Remove any closed orders
+	open = true
+	switch o.GetStatus().Status {
+	// These are the open cases
+	case "NEW":
+	case "PARTIALLY_FILLED":
+	case "PENDING_CANCEL":
+	case "":
+	// The rest are closed
+	default:
+		open = false
+	}
+	return
+}
+
+func isOrderStale(o *coinfactory.Order) bool {
+	return o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.markOrderAsStaleAfter").Nanoseconds()
+}
+
+func isOrderExpired(o *coinfactory.Order) bool {
+	return o.GetAge().Nanoseconds() > viper.GetDuration("followtheleaderprocessor.cancelOrderAfter").Nanoseconds()
 }

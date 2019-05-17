@@ -5,6 +5,10 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/shopspring/decimal"
+	"github.com/sinisterminister/coinfactory/pkg/binance"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/sinisterminister/coinfactory"
 	"github.com/spf13/viper"
 )
@@ -12,12 +16,23 @@ import (
 var (
 	SymbolService coinfactory.SymbolService
 	cf            coinfactory.Coinfactory
+	makerFee      decimal.Decimal
+	takerFee      decimal.Decimal
+	tradeFee      decimal.Decimal
 )
 
 func main() {
 	setDefaultConfigValues()
 	SymbolService = coinfactory.GetSymbolService()
 	cf = coinfactory.NewCoinFactory(newFollowTheLeaderProcessor)
+	data, err := binance.GetUserData()
+	if err != nil {
+		tradeFee = decimal.NewFromFloat(.002)
+	}
+	makerFee = decimal.NewFromFloat(float64(data.MakerCommission) / float64(10000))
+	takerFee = decimal.NewFromFloat(float64(data.TakerCommission) / float64(10000))
+	tradeFee = makerFee.Add(takerFee)
+	log.WithField("tradeFee", tradeFee).Info("trade fee percentage")
 	cf.Start()
 
 	// Intercept the interrupt signal and pass it along
