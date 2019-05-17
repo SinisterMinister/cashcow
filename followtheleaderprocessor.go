@@ -18,9 +18,13 @@ type FollowTheLeaderProcessor struct {
 	symbol             *coinfactory.Symbol
 	openOrders         []*coinfactory.Order
 	staleOrders        []*coinfactory.Order
+	firstOrderCount    int
+	secondOrderCount   int
 	janitorQuitChannel chan bool
 	openOrdersMux      *sync.RWMutex
 	staleOrdersMux     *sync.RWMutex
+	firstOrderMux      *sync.RWMutex
+	secondOrderMux     *sync.RWMutex
 	readyMutex         *sync.RWMutex
 	working            bool
 }
@@ -136,6 +140,10 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			// Nothing to do
 			return
 		}
+		// Add to firstOrders
+		processor.firstOrderMux.Lock()
+		processor.firstOrderCount++
+		processor.firstOrderMux.Unlock()
 
 		// Lock up the funds for the second order
 		funds := request1.Price.Mul(request1.Quantity)
@@ -157,6 +165,9 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 
 		select {
 		case <-order0.GetDoneChan():
+			processor.firstOrderMux.Lock()
+			processor.firstOrderCount--
+			processor.firstOrderMux.Unlock()
 			break
 		case <-interrupt:
 			cf.GetOrderManager().CancelOrder(order0)
@@ -164,7 +175,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		}
 
 		processor.pruneOpenOrders()
-		cf.GetBalanceManager().SubReservedBalance(request1.Symbol, funds)
+		cf.GetBalanceManager().SubReservedBalance(asset, funds)
 
 		// Don't do the next order if this one was canceled
 		if order0.GetStatus().Status == "CANCELED" {
@@ -179,12 +190,19 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			return
 		}
 
+		processor.secondOrderMux.Lock()
+		processor.secondOrderCount++
+		processor.secondOrderMux.Unlock()
+
 		processor.openOrdersMux.Lock()
 		processor.openOrders = append(processor.openOrders, order1)
 		processor.openOrdersMux.Unlock()
 
 		select {
 		case <-order1.GetDoneChan():
+			processor.secondOrderMux.Lock()
+			processor.secondOrderCount--
+			processor.secondOrderMux.Unlock()
 			// If canceled, give to order necromancer to handle
 			if order1.GetStatus().Status == "CANCELED" || order1.GetStatus().Status == "PARTIALLY_FILLED" {
 				log.WithField("order", order1).Info("order canceled. sending to necromancer for burial")
@@ -263,7 +281,7 @@ func (processor *FollowTheLeaderProcessor) buildUpwardTrendingOrders(data binanc
 	baseQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
 
 	// Buy price based on current asking price
-	buyPrice := data.AskPrice.Mul(decimal.NewFromFloat(1.0005))
+	buyPrice := data.AskPrice.Mul(decimal.NewFromFloat(1.0001))
 
 	// Sell price based on current asking price plus target spread
 	sellPrice := buyPrice.Add(data.AskPrice.Mul(targetSpread))
@@ -299,7 +317,7 @@ func (processor *FollowTheLeaderProcessor) buildDownwardTrendingOrders(data bina
 	baseQty := data.BaseVolume.Div(decimal.NewFromFloat(float64(data.TotalNumberOfTrades)))
 
 	// Sell price is based on the current bid price
-	sellPrice := data.BidPrice.Mul(decimal.NewFromFloat(0.9995))
+	sellPrice := data.BidPrice.Mul(decimal.NewFromFloat(0.9999))
 
 	// Buy price is based on the current bid price less the target spread
 	buyPrice := sellPrice.Div(decimal.NewFromFloat(1).Add(targetSpread))
@@ -372,7 +390,12 @@ func (processor *FollowTheLeaderProcessor) cleanUpOrders() {
 	processor.pruneOpenOrders()
 	processor.pruneStaleOrders()
 	processor.cancelExpiredStaleOrders()
-	log.WithField("open", len(processor.openOrders)).WithField("stale", len(processor.staleOrders)).Info(fmt.Sprintf("order counts for symbol %s", processor.symbol.Symbol))
+	log.WithFields(log.Fields{
+		"open":   len(processor.openOrders),
+		"stale":  len(processor.staleOrders),
+		"first":  processor.firstOrderCount,
+		"second": processor.secondOrderCount,
+	}).Info(fmt.Sprintf("order counts for symbol %s", processor.symbol.Symbol))
 }
 
 func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
