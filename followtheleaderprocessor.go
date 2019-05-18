@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/smira/go-statsd"
+
 	"github.com/shopspring/decimal"
 	"github.com/sinisterminister/coinfactory"
 	"github.com/sinisterminister/coinfactory/pkg/binance"
@@ -41,6 +43,7 @@ func (processor *FollowTheLeaderProcessor) ProcessData(data binance.SymbolTicker
 	// Check if ready for data
 	if !processor.isReady() {
 		// Not ready. Skip.
+		metrics.Incr(fmt.Sprintf("processors.%s.process-data-events.skips", processor.symbol.Symbol), 1)
 		return
 	}
 
@@ -78,11 +81,17 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		buyFirst                bool
 	)
 
+	stsd := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.process-data-events.", processor.symbol.Symbol))
+	ostsd := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.orders.", processor.symbol.Symbol))
+
 	// Lock the processor while we work
 	processor.lockProcessor()
+	stsd.Incr("attempts", 1)
+	stsd.Gauge("locked", 1)
 
 	// Unlock when we're finished
 	defer processor.unlockProcessor()
+	defer stsd.Gauge("locked", 0)
 
 	// Get count of stale orders
 	processor.openOrdersMux.RLock()
@@ -94,6 +103,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		// Throttle based on stalled orders
 		if numStaleOrders >= viper.GetInt("followtheleaderprocessor.maxStaleOrders") {
 			log.Debug("throttling due to too many stale orders")
+			stsd.Incr("fails", 1, statsd.StringTag("type", "throttled"))
 			return
 		}
 
@@ -104,8 +114,10 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		buyRequest, sellRequest, buyFirst, err = processor.buildTrixBasedOrderRequests(data)
 		if err != nil {
 			if e, ok := err.(UnstableTradeConditionError); ok {
+				stsd.Incr("fails", 1, statsd.StringTag("type", "trix-unstable"))
 				log.WithError(e).Debug("order bailed")
 			} else {
+				stsd.Incr("fails", 1, statsd.StringTag("type", "error"))
 				log.WithError(err).Error("could not build trix based order requests")
 			}
 
@@ -121,6 +133,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 
 	// Abort if order pair will fail or have a negative return
 	if ok := validateOrderPair(buyRequest, sellRequest); !ok {
+		stsd.Incr("fails", 1, statsd.StringTag("type", "validation"))
 		return
 	}
 
@@ -137,12 +150,15 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		order0, err := cf.GetOrderManager().AttemptOrder(request0)
 		if err != nil {
 			log.WithError(err).Error("Could not place order!")
+			stsd.Incr("fails", 1, statsd.StringTag("type", "error"))
+
 			// Nothing to do
 			return
 		}
 		// Add to firstOrders
 		processor.firstOrderMux.Lock()
 		processor.firstOrderCount++
+		ostsd.Incr("placed", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		processor.firstOrderMux.Unlock()
 
 		// Lock up the funds for the second order
@@ -170,6 +186,8 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			processor.firstOrderMux.Unlock()
 			break
 		case <-interrupt:
+			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("type",  "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
+			stsd.Incr("fails", 1, statsd.StringTag("type", "interrupt"))
 			cf.GetOrderManager().CancelOrder(order0)
 			return
 		}
@@ -179,19 +197,34 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 
 		// Don't do the next order if this one was canceled
 		if order0.GetStatus().Status == "CANCELED" {
+			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("type",  "cancelled"), statsd.StringTag("symbol", processor.symbol.Symbol))
 			log.Warn("first ordered canceled. skipping second order")
+			stsd.Incr("fails", 1, statsd.StringTag("type", "cancelled"))
 			return
+		} else {
+			ostsd.Incr("succeeded", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		}
+
+		stsd.Incr("halfways", 1)
 
 		order1, err := cf.GetOrderManager().AttemptOrder(request1)
 		if err != nil {
 			log.WithError(err).Error("Could not place order!")
-			// Nothing to do
+			stsd.Incr("fails", 1, statsd.StringTag("type", "error"))
+
+			// Try to bury
+			oerr := getOrderNecromancerInstance().BuryRequest(request1)
+			if oerr != nil {
+				log.WithError(oerr).Error("could not burry order")
+				stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
+			}
+			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", request1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			return
 		}
 
 		processor.secondOrderMux.Lock()
 		processor.secondOrderCount++
+		ostsd.Incr("placed", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		processor.secondOrderMux.Unlock()
 
 		processor.openOrdersMux.Lock()
@@ -206,15 +239,29 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			// If canceled, give to order necromancer to handle
 			if order1.GetStatus().Status == "CANCELED" || order1.GetStatus().Status == "PARTIALLY_FILLED" {
 				log.WithField("order", order1).Info("order canceled. sending to necromancer for burial")
+				ostsd.Incr("cancelled", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 				oerr := getOrderNecromancerInstance().BuryOrder(order1)
 				if oerr != nil {
 					log.WithError(oerr).Error("could not burry order")
+					stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
 				}
+				ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+			} else {
+				ostsd.Incr("succeeded", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				stsd.Incr("successes", 1)
 			}
+			
 			processor.pruneOpenOrders()
 		case <-interrupt:
+			stsd.Incr("fails", 1, statsd.StringTag("type", "second-interrupt"))
 			cf.GetOrderManager().CancelOrder(order1)
-			getOrderNecromancerInstance().BuryOrder(order1)
+			oerr := getOrderNecromancerInstance().BuryOrder(order1)
+			if oerr != nil {
+					ostsd.Incr("fails", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("type",  "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
+					log.WithError(oerr).Error("could not burry order")
+				stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
+			}
+			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			return
 		}
 
@@ -390,6 +437,11 @@ func (processor *FollowTheLeaderProcessor) cleanUpOrders() {
 	processor.pruneOpenOrders()
 	processor.pruneStaleOrders()
 	processor.cancelExpiredStaleOrders()
+	omets := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.orders.", processor.symbol.Symbol))
+	omets.Gauge("open", int64(len(processor.openOrders)))
+	omets.Gauge("stale", int64(len(processor.staleOrders)))
+	omets.Gauge("first", int64(processor.firstOrderCount))
+	omets.Gauge("second", int64(processor.secondOrderCount))
 	log.WithFields(log.Fields{
 		"open":   len(processor.openOrders),
 		"stale":  len(processor.staleOrders),
@@ -401,6 +453,7 @@ func (processor *FollowTheLeaderProcessor) cleanUpOrders() {
 func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
 	log.Debug("Pruning open orders")
 	openOrders := []*coinfactory.Order{}
+	omets := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.orders.", processor.symbol.Symbol))
 	for _, o := range processor.openOrders {
 		// Update open orders
 		go cf.GetOrderManager().UpdateOrderStatus(o)
@@ -413,6 +466,7 @@ func (processor *FollowTheLeaderProcessor) pruneOpenOrders() {
 		// Remove stale orders
 		if isOrderStale(o) {
 			// Mark order as stale
+			omets.Incr("stalled", 1, statsd.StringTag("side", o.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			log.WithField("order", o).Debug("Marking order as stale")
 			processor.staleOrders = append(processor.staleOrders, o)
 			continue
@@ -443,10 +497,13 @@ func (processor *FollowTheLeaderProcessor) pruneStaleOrders() {
 
 func (processor *FollowTheLeaderProcessor) cancelExpiredStaleOrders() {
 	staleOrders := []*coinfactory.Order{}
+	omets := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.orders.", processor.symbol.Symbol))
 	for _, o := range processor.staleOrders {
 		// Cancel expired orders
 		if isOrderExpired(o) {
 			log.WithField("order", o).Warn("Cancelling expired order")
+			omets.Incr("cancelled", 1, statsd.StringTag("side", o.Side),statsd.StringTag("type", "expired"), statsd.StringTag("symbol", processor.symbol.Symbol))
+
 			go cancelOrder(o)
 			continue
 		}

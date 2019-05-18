@@ -3,6 +3,8 @@ package main
 import (
 	"sync"
 
+	"github.com/smira/go-statsd"
+
 	"github.com/shopspring/decimal"
 
 	"github.com/sinisterminister/coinfactory"
@@ -39,7 +41,7 @@ func getOrderNecromancerInstance() *orderNecromancer {
 	return orderNecromancerInstance
 }
 
-func (o *orderNecromancer) buryRequest(req coinfactory.OrderRequest) (err error) {
+func (o *orderNecromancer) BuryRequest(req coinfactory.OrderRequest) (err error) {
 	// Lock the data for writing
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -53,6 +55,7 @@ func (o *orderNecromancer) buryRequest(req coinfactory.OrderRequest) (err error)
 
 	orders = append(orders, req)
 	err = o.db.Write("deadorders", req.Symbol, orders)
+	metrics.Incr("necromancer.bury", 1, statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side))
 	return
 }
 
@@ -65,7 +68,7 @@ func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
 		Quantity: order.GetStatus().OriginalQuantity.Sub(order.GetStatus().ExecutedQuantity),
 	}
 
-	o.buryRequest(req)
+	o.BuryRequest(req)
 
 	return
 }
@@ -85,9 +88,11 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 
 	for _, req := range allOrders {
 		if (req.Side == "BUY" && req.Price.GreaterThanOrEqual(ask)) || (req.Side == "SELL" && req.Price.LessThanOrEqual(bid)) {
+			metrics.Incr("necromancer.resurrect.attempt", 1, statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side))
 			orderReq = append(orderReq, req)
 			continue
 		}
+		metrics.Gauge("necromancer.buried", int64(len(savedOrders)), statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side))
 		savedOrders = append(savedOrders, req)
 	}
 
@@ -107,7 +112,8 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 			order, err := cf.GetOrderManager().AttemptOrder(req)
 			if err != nil {
 				log.WithField("order", req).WithError(err).Warn("could not resurrect order")
-				o.buryRequest(req)
+				metrics.Incr("necromancer.resurrect.failure", 1, statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side), statsd.StringTag("type", "error"))
+				o.BuryRequest(req)
 				continue
 			}
 
@@ -116,8 +122,11 @@ func (o *orderNecromancer) ResurrectOrders(symbol string, ask decimal.Decimal, b
 			go func() {
 				<-order.GetDoneChan()
 				if order.GetStatus().Status == "CANCELED" {
+					metrics.Incr("necromancer.resurrect.failure", 1, statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side), statsd.StringTag("type", "canceled"))
 					o.BuryOrder(order)
+					return
 				}
+				metrics.Incr("necromancer.resurrect.success", 1, statsd.StringTag("symbol", req.Symbol), statsd.StringTag("side", req.Side))
 			}()
 		}
 		close(loopDoneChan)

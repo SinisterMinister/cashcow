@@ -10,6 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/sinisterminister/coinfactory"
+	"github.com/smira/go-statsd"
 	"github.com/spf13/viper"
 )
 
@@ -19,9 +20,14 @@ var (
 	makerFee      decimal.Decimal
 	takerFee      decimal.Decimal
 	tradeFee      decimal.Decimal
+	metrics       *statsd.Client
 )
 
 func main() {
+	metrics = statsd.NewClient("localhost:8125",
+		statsd.TagStyle(statsd.TagFormatInfluxDB),
+		statsd.DefaultTags(statsd.StringTag("app", "cashcow")))
+
 	setDefaultConfigValues()
 	SymbolService = coinfactory.GetSymbolService()
 	cf = coinfactory.NewCoinFactory(newFollowTheLeaderProcessor)
