@@ -48,19 +48,23 @@ func validateOrderPair(buy coinfactory.OrderRequest, sell coinfactory.OrderReque
 	}
 
 	// Validate the orders are still viable
-	bv := buy.Price.Mul(buy.Quantity)
-	sv := sell.Price.Mul(sell.Quantity)
-	tc := bv.Mul(takerFee).Add(sv.Mul(makerFee))
-	r := sv.Sub(bv)
+	baseAssetFee := buy.Quantity.Mul(takerFee)
+	quoteAssetFee := sell.Quantity.Mul(sell.Price).Mul(makerFee)
+	baseReturn := buy.Quantity.Sub(sell.Quantity)
+	quoteReturn := sell.Price.Mul(sell.Quantity).Sub(buy.Price.Mul(buy.Quantity))
+	combinedReturn := baseReturn.Mul(sell.Price).Add(quoteReturn)
+	combinedFee := baseAssetFee.Mul(buy.Price).Add(quoteAssetFee)
 
-	// Bail out if we make no money
-	if r.LessThan(tc) {
+	if combinedReturn.LessThan(combinedFee) {
+		// Bail out if we make no money
 		log.WithFields(log.Fields{
 			"buy":  buy,
 			"sell": sell,
 		}).Debug("Skipping negative return order")
 		return false
 	}
+	bv := buy.Price.Mul(buy.Quantity)
+	sv := sell.Price.Mul(sell.Quantity)
 
 	// Bail out if not nominal order
 	mn := binance.GetSymbol(buy.Symbol).Filters.MinimumNotional.MinNotional

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -158,7 +159,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 		// Add to firstOrders
 		processor.firstOrderMux.Lock()
 		processor.firstOrderCount++
-		ostsd.Incr("placed", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+		ostsd.Incr("placed", 1, statsd.StringTag("order", "first"), statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		processor.firstOrderMux.Unlock()
 
 		// Lock up the funds for the second order
@@ -186,7 +187,7 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			processor.firstOrderMux.Unlock()
 			break
 		case <-interrupt:
-			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("type",  "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
+			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"), statsd.StringTag("side", order0.Side), statsd.StringTag("type", "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
 			stsd.Incr("fails", 1, statsd.StringTag("type", "interrupt"))
 			cf.GetOrderManager().CancelOrder(order0)
 			return
@@ -197,12 +198,12 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 
 		// Don't do the next order if this one was canceled
 		if order0.GetStatus().Status == "CANCELED" {
-			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("type",  "cancelled"), statsd.StringTag("symbol", processor.symbol.Symbol))
+			ostsd.Incr("fails", 1, statsd.StringTag("order", "first"), statsd.StringTag("side", order0.Side), statsd.StringTag("type", "cancelled"), statsd.StringTag("symbol", processor.symbol.Symbol))
 			log.Warn("first ordered canceled. skipping second order")
 			stsd.Incr("fails", 1, statsd.StringTag("type", "cancelled"))
 			return
 		} else {
-			ostsd.Incr("succeeded", 1, statsd.StringTag("order", "first"),statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+			ostsd.Incr("succeeded", 1, statsd.StringTag("order", "first"), statsd.StringTag("side", order0.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		}
 
 		stsd.Incr("halfways", 1)
@@ -218,13 +219,13 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 				log.WithError(oerr).Error("could not burry order")
 				stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
 			}
-			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", request1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", request1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			return
 		}
 
 		processor.secondOrderMux.Lock()
 		processor.secondOrderCount++
-		ostsd.Incr("placed", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+		ostsd.Incr("placed", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 		processor.secondOrderMux.Unlock()
 
 		processor.openOrdersMux.Lock()
@@ -237,31 +238,57 @@ func (processor *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTicke
 			processor.secondOrderCount--
 			processor.secondOrderMux.Unlock()
 			// If canceled, give to order necromancer to handle
-			if order1.GetStatus().Status == "CANCELED" || order1.GetStatus().Status == "PARTIALLY_FILLED" {
+			if order1.GetStatus().Status == "CANCELED" {
 				log.WithField("order", order1).Info("order canceled. sending to necromancer for burial")
-				ostsd.Incr("cancelled", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				ostsd.Incr("cancelled", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				var feeP decimal.Decimal
+				if request0.Side == "BUY" {
+					feeP = makerFee
+				} else {
+					feeP = takerFee
+				}
+				fee, _ := request0.Quantity.Mul(feeP).Float64()
+				metrics.FGaugeDelta("processors.returns."+strings.ToLower(processor.symbol.BaseAsset), -fee)
 				oerr := getOrderNecromancerInstance().BuryOrder(order1)
 				if oerr != nil {
 					log.WithError(oerr).Error("could not burry order")
 					stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
 				}
-				ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				ostsd.Incr("buried", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			} else {
-				ostsd.Incr("succeeded", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				ostsd.Incr("succeeded", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 				stsd.Incr("successes", 1)
+
+				// Calculate how much to save
+				targetReturn := decimal.NewFromFloat(viper.GetFloat64("followtheleaderprocessor.percentReturnTarget"))
+				returnPerc := targetReturn.Div(tradeFee.Add(targetReturn))
+				quoteAssetQty := sellRequest.Price.Mul(sellRequest.Quantity).Sub(buyRequest.Price.Mul(buyRequest.Quantity))
+				baseAssetQty := buyRequest.Quantity.Sub(sellRequest.Quantity)
+				keepBaseQty := baseAssetQty.Mul(returnPerc)
+				keepQuoteQty := quoteAssetQty.Mul(returnPerc)
+
+				fltBase, _ := keepBaseQty.Float64()
+				fltQuote, _ := keepQuoteQty.Float64()
+
+				// Save half of the return
+				cf.GetBalanceManager().AddReservedBalance(processor.symbol.BaseAsset, keepBaseQty.Div(decimal.NewFromFloat(2)))
+				cf.GetBalanceManager().AddReservedBalance(processor.symbol.QuoteAsset, keepQuoteQty.Div(decimal.NewFromFloat(2)))
+				metrics.FGaugeDelta("processors.returns."+strings.ToLower(processor.symbol.BaseAsset), fltBase)
+				metrics.FGaugeDelta("processors.returns."+strings.ToLower(processor.symbol.QuoteAsset), fltQuote)
+
 			}
-			
+
 			processor.pruneOpenOrders()
 		case <-interrupt:
 			stsd.Incr("fails", 1, statsd.StringTag("type", "second-interrupt"))
 			cf.GetOrderManager().CancelOrder(order1)
 			oerr := getOrderNecromancerInstance().BuryOrder(order1)
 			if oerr != nil {
-					ostsd.Incr("fails", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("type",  "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
-					log.WithError(oerr).Error("could not burry order")
+				ostsd.Incr("fails", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("type", "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
+				log.WithError(oerr).Error("could not burry order")
 				stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
 			}
-			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"),statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+			ostsd.Incr("buried", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order1.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
 			return
 		}
 
@@ -502,7 +529,7 @@ func (processor *FollowTheLeaderProcessor) cancelExpiredStaleOrders() {
 		// Cancel expired orders
 		if isOrderExpired(o) {
 			log.WithField("order", o).Warn("Cancelling expired order")
-			omets.Incr("cancelled", 1, statsd.StringTag("side", o.Side),statsd.StringTag("type", "expired"), statsd.StringTag("symbol", processor.symbol.Symbol))
+			omets.Incr("cancelled", 1, statsd.StringTag("side", o.Side), statsd.StringTag("type", "expired"), statsd.StringTag("symbol", processor.symbol.Symbol))
 
 			go cancelOrder(o)
 			continue

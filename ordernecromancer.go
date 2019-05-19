@@ -61,11 +61,22 @@ func (o *orderNecromancer) BuryRequest(req coinfactory.OrderRequest) (err error)
 
 func (o *orderNecromancer) BuryOrder(order *coinfactory.Order) (err error) {
 	// First, create an order request
-	req := coinfactory.OrderRequest{
-		Symbol:   order.Symbol,
-		Side:     order.Side,
-		Price:    order.Price,
-		Quantity: order.GetStatus().OriginalQuantity.Sub(order.GetStatus().ExecutedQuantity),
+	var req coinfactory.OrderRequest
+	orderID := order.GetStatus().OrderID
+	if orderID != 0 {
+		req = coinfactory.OrderRequest{
+			Symbol:   order.Symbol,
+			Side:     order.Side,
+			Price:    order.Price,
+			Quantity: order.GetStatus().OriginalQuantity.Sub(order.GetStatus().ExecutedQuantity),
+		}
+	} else {
+		req = coinfactory.OrderRequest{
+			Symbol:   order.Symbol,
+			Side:     order.Side,
+			Price:    order.Price,
+			Quantity: order.Quantity,
+		}
 	}
 
 	o.BuryRequest(req)
