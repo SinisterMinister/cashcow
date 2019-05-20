@@ -58,10 +58,59 @@ func (processor *FollowTheLeaderProcessor) init() {
 	if err != nil {
 		log.WithError(err).Error("could not fetch open orders")
 	}
+	processor.setupOrderFailureHandlers(orders)
 	processor.openOrdersMux.Lock()
 	processor.openOrders = orders
 	processor.openOrdersMux.Unlock()
 	go processor.startJanitor()
+}
+
+func (processor *FollowTheLeaderProcessor) setupOrderFailureHandlers(orders []*coinfactory.Order) {
+	stsd := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.process-data-events.", processor.symbol.Symbol))
+	ostsd := metrics.CloneWithPrefix(fmt.Sprintf("processors.%s.orders.", processor.symbol.Symbol))
+
+	for _, order := range orders {
+		go func(order *coinfactory.Order) {
+
+			// Intercept the interrupt signal and pass it along
+			interrupt := make(chan os.Signal, 1)
+			signal.Notify(interrupt, os.Interrupt)
+
+			select {
+			case <-order.GetDoneChan():
+		
+				// If canceled, give to order necromancer to handle
+				if order.GetStatus().Status == "CANCELED" {
+					log.WithField("order", order).Info("order canceled. sending to necromancer for burial")
+					ostsd.Incr("cancelled", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+
+					oerr := getOrderNecromancerInstance().BuryOrder(order)
+					if oerr != nil {
+						log.WithError(oerr).Error("could not burry order")
+						stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
+					}
+					ostsd.Incr("buried", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				} else {
+					ostsd.Incr("succeeded", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+					stsd.Incr("successes", 1)
+
+				}
+
+				processor.pruneOpenOrders()
+			case <-interrupt:
+				stsd.Incr("fails", 1, statsd.StringTag("type", "second-interrupt"))
+				cf.GetOrderManager().CancelOrder(order)
+				oerr := getOrderNecromancerInstance().BuryOrder(order)
+				if oerr != nil {
+					ostsd.Incr("fails", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order.Side), statsd.StringTag("type", "interrupt"), statsd.StringTag("symbol", processor.symbol.Symbol))
+					log.WithError(oerr).Error("could not burry order")
+					stsd.Incr("fails", 1, statsd.StringTag("type", "unrecoverable"))
+				}
+				ostsd.Incr("buried", 1, statsd.StringTag("order", "second"), statsd.StringTag("side", order.Side), statsd.StringTag("symbol", processor.symbol.Symbol))
+				return
+			}
+		}(order)
+	}
 }
 
 func (processor *FollowTheLeaderProcessor) lockProcessor() {
