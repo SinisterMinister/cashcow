@@ -26,7 +26,7 @@ func main() {
 		processor := &Processor{Symbol: symbol}
 
 		// Kick off the ticker stream processor routine
-		go processor.handleTickerStreamData(stopChan)
+		processor.HandleTickerStreamData(stopChan)
 	}
 
 	// Start coinfactory
