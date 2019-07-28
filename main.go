@@ -4,8 +4,11 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/shopspring/decimal"
 	"github.com/sinisterminister/coinfactory"
 )
+
+var tradeFee decimal.Decimal
 
 func main() {
 	// First thing's first, load config
@@ -23,10 +26,10 @@ func main() {
 		symbol := coinfactory.GetSymbolService().GetSymbol(name)
 
 		// Create the processor to do the work
-		processor := &Processor{Symbol: symbol}
+		processor := &FollowTheLeaderProcessor{Symbol: symbol}
 
 		// Kick off the ticker stream processor routine
-		processor.HandleTickerStreamData(stopChan)
+		processor.Launch(stopChan)
 	}
 
 	// Start coinfactory
