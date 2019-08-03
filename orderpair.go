@@ -287,6 +287,7 @@ func (op *OrderPair) watchForResurrection() {
 
 		// Watch ticker stream
 		for {
+			// bail on stop
 			select {
 			case <-op.stopChan:
 				return
@@ -308,15 +309,18 @@ func (op *OrderPair) watchForResurrection() {
 
 func (op *OrderPair) shouldResurrect(data binance.SymbolTickerData) bool {
 	if op.secondOrder.Side == "BUY" {
+		// If the ask price is less than or equal to the request price, we should resurrect
 		if data.AskPrice.LessThanOrEqual(op.secondRequest.Price) {
 			return true
 		}
 	} else {
+		// If the bid price is greater than or equal to the request price, we should resurrect
 		if data.BidPrice.GreaterThanOrEqual(op.secondRequest.Price) {
 			return true
 		}
 	}
 
+	// Not time to resurrect
 	return false
 }
 
