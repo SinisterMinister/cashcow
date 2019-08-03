@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"github.com/sinisterminister/coinfactory"
@@ -135,10 +136,11 @@ func (op *OrderPair) Execute() {
 func (op *OrderPair) attemptOrders() {
 	// Spawn a goroutine to attempt the orders
 	go func() {
+		// Place the first order
 		firstOrder, err := coinfactory.GetOrderService().AttemptOrder(op.firstOrderRequest)
 		if err != nil {
 			log.WithError(err).WithField("request", op.firstOrderRequest).Errorf("Order attempt failed!")
-			return
+			return // Nothing more to do
 		}
 
 		// Store the order
@@ -146,9 +148,35 @@ func (op *OrderPair) attemptOrders() {
 		op.firstOrder = &Order{firstOrder}
 		op.orderMutex.Unlock()
 
-		// Wait for the first order to finish and then kick off the second order
-		<-firstOrder.GetDoneChan()
+		// Setup the timeout for the first order
+		timer := time.NewTimer(viper.GetDuration("followTheLeaderProcessor.firstOrderTimeout"))
 
+		// Wait for the first order to finish and then kick off the second order
+		select {
+		case <-timer.C:
+			// Order timed out, so time to cancel it
+			log.WithField("order", op.firstOrder).Warn("First order timed out. Cancelling.")
+			err := coinfactory.GetOrderService().CancelOrder(op.firstOrder.Order)
+			if err != nil {
+				log.WithError(err).WithField("order", op.firstOrder).Errorf("Order cancellation failed!")
+			}
+		case <-firstOrder.GetDoneChan():
+			// Order complete
+		}
+
+		// Check to see if any of it was fulfilled
+		if op.firstOrder.GetStatus().ExecutedQuantity.IsZero() {
+			// Nothing was executed. Must be cancelled. Bail
+			return
+		}
+
+		// Update the second order request with the fulfilled amount in case only partially filled
+		op.secondOrderRequest.Quantity = op.firstOrder.GetStatus().ExecutedQuantity
+
+		// Normalize the request
+		op.normalizeRequests()
+
+		// Place the second order
 		secondOrder, err := coinfactory.GetOrderService().AttemptOrder(op.secondOrderRequest)
 		if err != nil {
 			log.WithError(err).WithField("request", op.secondOrderRequest).Errorf("Order attempt failed!")
@@ -159,6 +187,9 @@ func (op *OrderPair) attemptOrders() {
 		op.orderMutex.Lock()
 		op.secondOrder = &Order{secondOrder}
 		op.orderMutex.Unlock()
+
+		// Wait for the order to finish
+		<-op.GetSecondOrder().GetDoneChan()
 
 		// Close the done chan since we're finished
 		close(op.doneChan)
