@@ -6,7 +6,7 @@ import (
 )
 
 type Order struct {
-	coinfactory.Order
+	*coinfactory.Order
 }
 
 func (o *Order) IsStale() bool {

@@ -8,11 +8,18 @@ import (
 	"github.com/sinisterminister/coinfactory"
 )
 
-var tradeFee decimal.Decimal
+var (
+	makerFee decimal.Decimal
+	takerFee decimal.Decimal
+	tradeFee decimal.Decimal
+)
 
 func main() {
-	// First thing's first, load config
-	setDefaultConfigValues()
+	// First thing's first, load configs
+	setupDefaultConfigValues()
+
+	// Fetch the fees
+	fetchFees()
 
 	// Create a stop channel to handle exiting
 	stopChan := make(chan bool)

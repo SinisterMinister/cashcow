@@ -1,10 +1,12 @@
 package main
 
 import (
+	"math"
 	"strings"
 
 	"github.com/shopspring/decimal"
 
+	"github.com/sinisterminister/coinfactory"
 	"github.com/sinisterminister/coinfactory/pkg/binance"
 	"github.com/spf13/viper"
 )
@@ -34,12 +36,7 @@ func fetchWatchedSymbols() []string {
 	return filterSymbols(binance.GetSymbolsAsStrings())
 }
 
-func getTradeFee() decimal.Decimal {
-	var (
-		makerFee decimal.Decimal
-		takerFee decimal.Decimal
-		tradeFee decimal.Decimal
-	)
+func fetchFees() decimal.Decimal {
 	data, err := binance.GetUserData()
 	if err != nil {
 		tradeFee = decimal.NewFromFloat(.002)
@@ -49,4 +46,18 @@ func getTradeFee() decimal.Decimal {
 	tradeFee = makerFee.Add(takerFee)
 
 	return tradeFee
+}
+
+func normalizePrice(price decimal.Decimal, symbol *coinfactory.Symbol) decimal.Decimal {
+	// Get decimal places and round to that precision
+	ts, _ := symbol.Filters.Price.TickSize.Float64()
+	places := int32(math.Log10(ts)) * -1
+	return price.Round(places)
+}
+
+func normalizeQuantity(qty decimal.Decimal, symbol *coinfactory.Symbol) decimal.Decimal {
+	// Get decimal places and round to that precision
+	ss, _ := symbol.Filters.LotSize.StepSize.Float64()
+	places := int32(math.Log10(ss)) * -1
+	return qty.Round(places)
 }
