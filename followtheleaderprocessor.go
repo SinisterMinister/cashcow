@@ -18,10 +18,12 @@ type Processor interface {
 type FollowTheLeaderProcessor struct {
 	Symbol        *coinfactory.Symbol
 	lastOrderPair *OrderPair
+	stopChan      <-chan bool
 }
 
 // Launch starts the various sub-processors of the processor
 func (p *FollowTheLeaderProcessor) Launch(stopChan <-chan bool) {
+	p.stopChan = stopChan
 	p.handleTickerStreamData(stopChan)
 }
 
@@ -82,11 +84,11 @@ func (p *FollowTheLeaderProcessor) attemptOrder(data binance.SymbolTickerData) {
 			}
 			return
 		}
-		orderPair = buildOrderPair(firstRequest, secondRequest)
+		orderPair = buildOrderPair(p.stopChan, firstRequest, secondRequest)
 	} else {
 		// There's already an open order to follow, so lets follow it
 		firstRequest, secondRequest := p.buildLeaderBasedOrderRequests(data)
-		orderPair = buildOrderPair(firstRequest, secondRequest)
+		orderPair = buildOrderPair(p.stopChan, firstRequest, secondRequest)
 	}
 
 	orderPair.Execute()

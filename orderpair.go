@@ -13,10 +13,12 @@ import (
 
 // OrderPair contains the Buy/Sell order pair that we'll attempt to make
 type OrderPair struct {
-	firstOrderRequest  coinfactory.OrderRequest
-	secondOrderRequest coinfactory.OrderRequest
+	firstRequest         coinfactory.OrderRequest
+	originalFirstRequest coinfactory.OrderRequest
 
-	buyOrders  []*Order
+	secondRequest         coinfactory.OrderRequest
+	originalSecondRequest coinfactory.OrderRequest
+
 	sellOrders []*Order
 
 	firstOrder  *Order
@@ -25,14 +27,18 @@ type OrderPair struct {
 	symbol      *coinfactory.Symbol
 
 	doneChan chan bool
+	stopChan <-chan bool
 }
 
-func buildOrderPair(firstRequest coinfactory.OrderRequest, secondRequest coinfactory.OrderRequest) *OrderPair {
+func buildOrderPair(stopChan <-chan bool, firstRequest coinfactory.OrderRequest, secondRequest coinfactory.OrderRequest) *OrderPair {
 	return &OrderPair{
-		firstOrderRequest:  firstRequest,
-		secondOrderRequest: secondRequest,
-		orderMutex:         &sync.RWMutex{},
-		symbol:             coinfactory.GetSymbolService().GetSymbol(firstRequest.Symbol),
+		firstRequest:          firstRequest,
+		originalFirstRequest:  firstRequest,
+		secondRequest:         secondRequest,
+		originalSecondRequest: secondRequest,
+		orderMutex:            &sync.RWMutex{},
+		symbol:                coinfactory.GetSymbolService().GetSymbol(firstRequest.Symbol),
+		stopChan:              stopChan,
 	}
 }
 
@@ -97,20 +103,20 @@ func (op *OrderPair) GetSecondOrder() *Order {
 func (op *OrderPair) GetBuyRequest() coinfactory.OrderRequest {
 	op.orderMutex.RLock()
 	defer op.orderMutex.RUnlock()
-	if op.firstOrderRequest.Side == "BUY" {
-		return op.firstOrderRequest
+	if op.firstRequest.Side == "BUY" {
+		return op.firstRequest
 	}
-	return op.secondOrderRequest
+	return op.secondRequest
 }
 
 func (op *OrderPair) GetSellRequest() coinfactory.OrderRequest {
 	op.orderMutex.RLock()
 	defer op.orderMutex.RUnlock()
 
-	if op.firstOrderRequest.Side == "SELL" {
-		return op.firstOrderRequest
+	if op.firstRequest.Side == "SELL" {
+		return op.firstRequest
 	}
-	return op.secondOrderRequest
+	return op.secondRequest
 }
 
 func (op *OrderPair) Execute() {
@@ -154,9 +160,9 @@ func (op *OrderPair) attemptOrders() {
 }
 
 func (op *OrderPair) handleFirstOrder() {
-	firstOrder, err := coinfactory.GetOrderService().AttemptOrder(op.firstOrderRequest)
+	firstOrder, err := coinfactory.GetOrderService().AttemptOrder(op.firstRequest)
 	if err != nil {
-		log.WithError(err).WithField("request", op.firstOrderRequest).Errorf("Order attempt failed!")
+		log.WithError(err).WithField("request", op.firstRequest).Errorf("Order attempt failed!")
 		return // Nothing more to do
 	}
 
@@ -184,15 +190,17 @@ func (op *OrderPair) handleFirstOrder() {
 
 func (op *OrderPair) handleSecondOrder() {
 	// Update the second order request with the fulfilled amount in case only partially filled
-	op.secondOrderRequest.Quantity = op.firstOrder.GetStatus().ExecutedQuantity
+	if op.firstOrder.GetStatus().ExecutedQuantity.LessThan(op.firstOrder.Quantity) {
+		op.secondRequest.Quantity = op.firstOrder.GetStatus().ExecutedQuantity
 
-	// Normalize the request
-	op.normalizeRequests()
+		// Normalize the request
+		op.normalizeRequests()
+	}
 
 	// Place the second order
-	secondOrder, err := coinfactory.GetOrderService().AttemptOrder(op.secondOrderRequest)
+	secondOrder, err := coinfactory.GetOrderService().AttemptOrder(op.secondRequest)
 	if err != nil {
-		log.WithError(err).WithField("request", op.secondOrderRequest).Errorf("Order attempt failed!")
+		log.WithError(err).WithField("request", op.secondRequest).Errorf("Order attempt failed!")
 		return
 	}
 
@@ -201,8 +209,125 @@ func (op *OrderPair) handleSecondOrder() {
 	op.secondOrder = &Order{secondOrder}
 	op.orderMutex.Unlock()
 
+	// Watch for reaping
+	op.watchForReaping()
+
 	// Wait for the order to finish
 	<-op.GetSecondOrder().GetDoneChan()
+}
+
+func (op *OrderPair) watchForReaping() {
+	go func() {
+		// Get ticker stream
+		tickerStream := op.symbol.GetTickerStream(op.doneChan)
+
+		for {
+			select {
+			case <-op.doneChan:
+				// Bail if done
+				return
+			default:
+			}
+
+			select {
+			case <-op.doneChan:
+				// Bail if done
+				return
+			case data := <-tickerStream:
+				// Reap if necessary
+				if op.shouldReap(data) {
+					op.reap()
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (op *OrderPair) shouldReap(data binance.SymbolTickerData) bool {
+	// Get the reap price
+	var reapPrice decimal.Decimal
+	spreadMultiplier := decimal.NewFromFloat(viper.GetFloat64("followtheleaderprocessor.reaperSpreadMultiplier"))
+	maxSpreadDistance := decimal.NewFromFloat(viper.GetFloat64("followtheleaderprocessor.percentReturnTarget")).Mul(spreadMultiplier)
+	reapPriceDistance := op.secondOrder.Price.Mul(maxSpreadDistance)
+
+	if op.secondOrder.Side == "BUY" {
+		reapPrice = op.secondOrder.Price.Add(reapPriceDistance)
+		if data.AskPrice.GreaterThanOrEqual(reapPrice) {
+			return true
+		}
+	} else {
+		reapPrice = op.secondOrder.Price.Sub(reapPriceDistance)
+		if data.BidPrice.LessThanOrEqual(reapPrice) {
+			return true
+		}
+	}
+	return false
+}
+
+func (op *OrderPair) reap() {
+	// Cancel the order
+	err := coinfactory.GetOrderService().CancelOrder(op.secondOrder.Order)
+	if err != nil {
+		log.WithError(err).WithField("order", op.secondOrder).Errorf("Order cancellation failed!")
+	}
+
+	// update the request
+	op.orderMutex.Lock()
+	op.secondRequest.Quantity = op.secondRequest.Quantity.Sub(op.secondOrder.GetStatus().ExecutedQuantity)
+	op.orderMutex.Unlock()
+
+	// Watch for resurrection
+	op.watchForResurrection()
+}
+
+func (op *OrderPair) watchForResurrection() {
+	go func() {
+		tickerStream := op.symbol.GetTickerStream(op.stopChan)
+
+		// Watch ticker stream
+		for {
+			select {
+			case <-op.stopChan:
+				return
+			default:
+			}
+
+			select {
+			case <-op.stopChan:
+				return
+			case data := <-tickerStream:
+				if op.shouldResurrect(data) {
+					op.resurrect()
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (op *OrderPair) shouldResurrect(data binance.SymbolTickerData) bool {
+	if op.secondOrder.Side == "BUY" {
+		if data.AskPrice.LessThanOrEqual(op.secondRequest.Price) {
+			return true
+		}
+	} else {
+		if data.BidPrice.GreaterThanOrEqual(op.secondRequest.Price) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (op *OrderPair) resurrect() {
+	// Reset the done channel
+	op.orderMutex.Lock()
+	op.doneChan = make(chan bool)
+	op.orderMutex.Unlock()
+
+	// Kick of the second order
+	go op.handleSecondOrder()
 }
 
 func (op *OrderPair) adjustRequestsBasedOnWalletBalances() {
@@ -212,12 +337,12 @@ func (op *OrderPair) adjustRequestsBasedOnWalletBalances() {
 	symbol := op.symbol.Symbol
 	quoteBalance := coinfactory.GetBalanceManager().GetUsableBalance(symbol)
 	baseBalance := coinfactory.GetBalanceManager().GetUsableBalance(symbol)
-	if op.firstOrderRequest.Side == "BUY" {
-		buyRequest = &op.firstOrderRequest
-		sellRequest = &op.secondOrderRequest
+	if op.firstRequest.Side == "BUY" {
+		buyRequest = &op.firstRequest
+		sellRequest = &op.secondRequest
 	} else {
-		buyRequest = &op.secondOrderRequest
-		sellRequest = &op.firstOrderRequest
+		buyRequest = &op.secondRequest
+		sellRequest = &op.firstRequest
 	}
 
 	// Percentage of the wallet balance to use for the order
@@ -240,20 +365,20 @@ func (op *OrderPair) adjustRequestsBasedOnWalletBalances() {
 
 func (op *OrderPair) normalizeRequests() {
 	// Normalize the price
-	op.firstOrderRequest.Price = normalizePrice(op.firstOrderRequest.Price, op.symbol)
-	op.secondOrderRequest.Price = normalizePrice(op.secondOrderRequest.Price, op.symbol)
+	op.firstRequest.Price = normalizePrice(op.firstRequest.Price, op.symbol)
+	op.secondRequest.Price = normalizePrice(op.secondRequest.Price, op.symbol)
 
 	// Normalize quantities
-	op.firstOrderRequest.Quantity = normalizeQuantity(op.firstOrderRequest.Quantity, op.symbol)
-	op.secondOrderRequest.Quantity = normalizeQuantity(op.secondOrderRequest.Quantity, op.symbol)
+	op.firstRequest.Quantity = normalizeQuantity(op.firstRequest.Quantity, op.symbol)
+	op.secondRequest.Quantity = normalizeQuantity(op.secondRequest.Quantity, op.symbol)
 }
 
 func (op *OrderPair) validateRequests() bool {
 	// Bail on zero value trades
-	if op.firstOrderRequest.Quantity.Equals(decimal.Zero) || op.secondOrderRequest.Quantity.Equals(decimal.Zero) {
+	if op.firstRequest.Quantity.Equals(decimal.Zero) || op.secondRequest.Quantity.Equals(decimal.Zero) {
 		log.WithFields(log.Fields{
-			"firstRequest": op.firstOrderRequest,
-			"secondSecond": op.secondOrderRequest,
+			"firstRequest": op.firstRequest,
+			"secondSecond": op.secondRequest,
 		}).Debug("Skipping zero value order")
 		return false
 	}
