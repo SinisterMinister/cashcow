@@ -30,6 +30,16 @@ type OrderPair struct {
 	stopChan <-chan bool
 }
 
+type OrderPairDTO struct {
+	FirstRequest          coinfactory.OrderRequest
+	OriginalFirstRequest  coinfactory.OrderRequest
+	SecondRequest         coinfactory.OrderRequest
+	OriginalSecondRequest coinfactory.OrderRequest
+
+	FirstOrderId  int
+	SecondOrderId int
+}
+
 func buildOrderPair(stopChan <-chan bool, firstRequest coinfactory.OrderRequest, secondRequest coinfactory.OrderRequest) *OrderPair {
 	return &OrderPair{
 		firstRequest:          firstRequest,
@@ -223,6 +233,8 @@ func (op *OrderPair) watchForReaping() {
 
 		for {
 			select {
+			case <-op.stopChan:
+				return
 			case <-op.doneChan:
 				// Bail if done
 				return
@@ -230,6 +242,8 @@ func (op *OrderPair) watchForReaping() {
 			}
 
 			select {
+			case <-op.stopChan:
+				return
 			case <-op.doneChan:
 				// Bail if done
 				return
